@@ -1,132 +1,256 @@
 using UnityEngine;
-using UnityEngine.Rendering;
 using UnityEditor;
 using UnityEditor.AssetImporters;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 
 namespace StoryLabResearch.PointCloud
 {
-    [ScriptedImporter(2, "ply")]
+    [ScriptedImporter(7, "ply")]
     class PlyImporter : ScriptedImporter
     {
-        public enum EAssetContainerType { PointMesh, BakedTexture }
-        public enum EMaterialMode { Unique, Custom, ShareDefault }
+        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.octree/runtime/shaders/";
+
+        public enum EAxisPreset
+        {
+            // PLY has no axis convention — these presets cover the most common real-world cases.
+            ZUpRightHanded,  // Photogrammetry / LiDAR standard (RealityCapture, Metashape, RiSCAN).
+                             // PLY (x,y,z) → Unity (-x, z, y). Negates X to correct handedness.
+            ZUpLeftHanded,   // CloudCompare default export and some other tools.
+                             // PLY (x,y,z) → Unity (x, z, y). No handedness correction.
+            YUpRightHanded,  // Blender / DCC right-handed Y-up.
+                             // PLY (x,y,z) → Unity (x, y, -z).
+            None,            // Pass-through — raw PLY values used as-is.
+            Custom,          // Use the AxisX/AxisY/AxisZ fields below.
+        }
+
+        public enum EAxis { PosX, NegX, PosY, NegY, PosZ, NegZ }
+
+        [Tooltip("Maps PLY axes to Unity world axes. " +
+                 "Most photogrammetry and LiDAR tools export Z-up right-handed.")]
+        public EAxisPreset AxisPreset = EAxisPreset.ZUpRightHanded;
+
+        [Tooltip("Which PLY axis (±) maps to Unity +X. Only used when AxisPreset is Custom.")]
+        public EAxis AxisX = EAxis.PosX;
+        [Tooltip("Which PLY axis (±) maps to Unity +Y. Only used when AxisPreset is Custom.")]
+        public EAxis AxisY = EAxis.PosZ;
+        [Tooltip("Which PLY axis (±) maps to Unity +Z. Only used when AxisPreset is Custom.")]
+        public EAxis AxisZ = EAxis.PosY;
 
         public float Rescale = 1.0f;
         public bool ApplySRGBCorrection;
-        public EAssetContainerType ContainerType = EAssetContainerType.PointMesh;
 
-        public PointMeshSubsampler.ESubsampleMode SubsampleMode = PointMeshSubsampler.ESubsampleMode.None;
-        public float SubsampleValue = 1f;
+        [Tooltip("Optional shared import properties asset. When set, overrides all settings below.")]
+        public PointCloudImportProperties ImportProperties;
 
-        public EMaterialMode MaterialMode = EMaterialMode.Unique;
-        public Material CustomMaterialOverride;
-        public bool ExtractUniqueMaterial = true;
+        // Inline settings — used when ImportProperties is null.
+        [Tooltip("Quality tier (PC / Mac / Consoles).")]
+        public PlatformImportTier Quality;
 
-        public bool DebugRangeColors = false;
-        public int DebugRange = 13429;
+        [Tooltip("Performance tier (Android / Quest).")]
+        public PlatformImportTier Performance;
 
-        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.octree/runtime/shaders/";
-
-        private const bool USE_ALPHA_FOR_POINT_SIZE_MULTIPLER = true;
-        // shader uses alpha as a point size multiplier
+        // Resolved accessors — read from ImportProperties if set, else inline fields.
+        private PlatformImportTier R_Quality     => ImportProperties != null ? ImportProperties.Quality     : Quality;
+        private PlatformImportTier R_Performance => ImportProperties != null ? ImportProperties.Performance : Performance;
 
         public override void OnImportAsset(AssetImportContext context)
         {
-            switch (ContainerType)
+            // Clean up any old sidecar .bin files left in Assets/ by earlier import versions.
+            DeleteOldSidecarBins(context.assetPath);
+
+            ReadPointData(context.assetPath, out var positions, out var colors);
+            if (positions == null) return;
+
+            ApplyAxisSwizzle(positions);
+
+            var name            = Path.GetFileNameWithoutExtension(context.assetPath);
+            var qualityTier     = R_Quality;
+            var performanceTier = R_Performance;
+
+            var qualityAsset = OctreeBuilder.BuildFromPointsEmbedded(
+                positions, colors, qualityTier.MinPointSpacing);
+            if (qualityAsset == null) return;
+
+            var performanceAsset = OctreeBuilder.BuildFromPointsEmbedded(
+                positions, colors, performanceTier.MinPointSpacing);
+            if (performanceAsset == null) return;
+
+            qualityAsset.name     = name + "_Quality";
+            performanceAsset.name = name + "_Performance";
+
+            // Resolve materials for each tier.
+            var qualityMat     = ResolveMaterial(context, qualityTier,     name + "_Quality",     "material_quality");
+            var performanceMat = ResolveMaterial(context, performanceTier, name + "_Performance", "material_performance");
+
+            // Build the prefab.
+            var go = new GameObject(name);
+            var renderer = go.AddComponent<OctreeRenderer>();
+
+            renderer.SetImportedAsset(
+                new PerPlatformAssets    { Quality = qualityAsset,  Performance = performanceAsset },
+                new PerPlatformMaterials { Quality = qualityMat,    Performance = performanceMat },
+                new PerPlatformRenderProperties
+                {
+                    Quality     = qualityTier.RenderProperties,
+                    Performance = performanceTier.RenderProperties,
+                });
+
+            context.AddObjectToAsset("octree_quality",     qualityAsset);
+            context.AddObjectToAsset("octree_performance", performanceAsset);
+            context.AddObjectToAsset("prefab", go);
+            context.SetMainObject(go);
+        }
+
+        // Resolves the material for a tier:
+        //   Shared      — returns the source material directly (no copy).
+        //   Instantiated — embeds a copy as a sub-asset inside the .ply import.
+        //   Extracted   — writes a standalone .mat next to the .ply and returns a reference to it.
+        //                  If the .mat already exists it is reused without overwriting.
+        private Material ResolveMaterial(AssetImportContext context,
+            PlatformImportTier tier, string assetName, string subAssetKey)
+        {
+            var sourceMat = tier.Material != null ? tier.Material : GetDefaultOctreeMaterial();
+
+            switch (tier.MaterialMode)
             {
-                case EAssetContainerType.PointMesh:
-                    ImportAsPointMesh(context);
-                    break;
-                case EAssetContainerType.BakedTexture:
-                    ImportAsBakedTexture(context);
-                    break;
-                default:
-                    throw new NotImplementedException();
+                case PointCloudImportProperties.EMaterialMode.Instantiated:
+                {
+                    var copy = new Material(sourceMat) { name = assetName };
+                    context.AddObjectToAsset(subAssetKey, copy);
+                    return copy;
+                }
+
+                case PointCloudImportProperties.EMaterialMode.Extracted:
+                {
+                    // Sidecar path: MyCloud_Quality.mat / MyCloud_Performance.mat next to the .ply.
+                    var matAssetPath = Path.ChangeExtension(context.assetPath, null) + "_" + assetName + ".mat";
+                    var matFullPath  = Path.GetFullPath(
+                        Path.Combine(Application.dataPath, "..", matAssetPath));
+
+                    if (!File.Exists(matFullPath))
+                    {
+                        var copy = new Material(sourceMat) { name = assetName };
+                        // Write to disk and import immediately so AssetDatabase knows about it.
+                        AssetDatabase.CreateAsset(copy, matAssetPath);
+                        AssetDatabase.ImportAsset(matAssetPath,
+                            ImportAssetOptions.ForceSynchronousImport);
+                    }
+
+                    var existing = AssetDatabase.LoadAssetAtPath<Material>(matAssetPath);
+                    if (existing != null)
+                    {
+                        context.DependsOnArtifact(matAssetPath);
+                        return existing;
+                    }
+
+                    // Fallback: embed if sidecar write somehow failed.
+                    Debug.LogWarning($"[PlyImporter] Could not create extracted material at " +
+                                     $"'{matAssetPath}', falling back to embedded.");
+                    var fallback = new Material(sourceMat) { name = assetName };
+                    context.AddObjectToAsset(subAssetKey, fallback);
+                    return fallback;
+                }
+
+                default: // Shared
+                    return sourceMat;
             }
         }
 
-        private void ImportAsBakedTexture(AssetImportContext context)
+        private void ApplyAxisSwizzle(Vector3[] positions)
         {
-            var data = ReadDataAsBaked(context.assetPath);
-            if (data != null)
+            // Resolve the three signed-axis selectors for the active preset.
+            EAxis ax, ay, az;
+            switch (AxisPreset)
             {
-                context.AddObjectToAsset("container", data);
-                context.AddObjectToAsset("position", data.positionMap);
-                context.AddObjectToAsset("color", data.colorMap);
-                context.SetMainObject(data);
+                case EAxisPreset.ZUpRightHanded: ax = EAxis.NegX; ay = EAxis.PosZ; az = EAxis.PosY; break;
+                case EAxisPreset.ZUpLeftHanded:  ax = EAxis.PosX; ay = EAxis.PosZ; az = EAxis.PosY; break;
+                case EAxisPreset.YUpRightHanded: ax = EAxis.PosX; ay = EAxis.PosY; az = EAxis.NegZ; break;
+                case EAxisPreset.None:           return;
+                default: /* Custom */            ax = AxisX; ay = AxisY; az = AxisZ; break;
+            }
+
+            for (int i = 0; i < positions.Length; i++)
+            {
+                var p = positions[i];
+                positions[i] = new Vector3(
+                    SampleAxis(p, ax),
+                    SampleAxis(p, ay),
+                    SampleAxis(p, az));
             }
         }
 
-        private void ImportAsPointMesh(AssetImportContext context)
+        private static float SampleAxis(Vector3 p, EAxis axis)
         {
-            var mesh = ReadDataAsMesh(context.assetPath, false);
-            if (mesh == null) return;
-
-            if (SubsampleMode != PointMeshSubsampler.ESubsampleMode.None)
-                mesh = PointMeshSubsampler.SubsampleMesh(SubsampleMode, mesh, mesh.name, SubsampleValue);
-
-            var material = GetAndAddMaterial(context, mesh.name);
-
-            var rootGameObject = new GameObject();
-            rootGameObject.name = mesh.name;
-
-            var meshFilter = rootGameObject.AddComponent<MeshFilter>();
-            meshFilter.sharedMesh = mesh;
-
-            var meshRenderer = rootGameObject.AddComponent<MeshRenderer>();
-            meshRenderer.sharedMaterial = material;
-
-            context.AddObjectToAsset("mesh", mesh);
-            context.AddObjectToAsset("prefab", rootGameObject);
-            context.SetMainObject(rootGameObject);
-        }
-
-        private Material GetAndAddMaterial(AssetImportContext context, string name)
-        {
-            switch (MaterialMode)
+            switch (axis)
             {
-                case EMaterialMode.Unique:
-                    var material = new Material(GetPipelineSpecificDefaultMaterial().shader);
-                    material.name = name;
-                    if (ExtractUniqueMaterial)
-                        AssetDatabase.CreateAsset(material, Path.Combine(Path.GetDirectoryName(context.assetPath), Path.GetFileName(context.assetPath) + ".mat"));
-                    else
-                        context.AddObjectToAsset("Unique Material", material);
-                    return material;
-
-                case EMaterialMode.Custom:
-                    return CustomMaterialOverride;
-
-                default:
-                    return GetPipelineSpecificDefaultMaterial();
+                case EAxis.PosX: return  p.x;
+                case EAxis.NegX: return -p.x;
+                case EAxis.PosY: return  p.y;
+                case EAxis.NegY: return -p.y;
+                case EAxis.PosZ: return  p.z;
+                default:         return -p.z; // NegZ
             }
         }
 
-        static Material GetPipelineSpecificDefaultMaterial()
+        private void ReadPointData(string path, out Vector3[] positions, out uint[] colors)
         {
-            var path = SHADER_PATH;
-
-            if (GraphicsSettings.currentRenderPipeline != null)
+            try
             {
-                var pipelineType = GraphicsSettings.currentRenderPipeline.GetType().FullName;
-                if (pipelineType.Contains("Universal"))
-                    path += "URP";
-                else if (pipelineType.Contains("HighDefinition") || pipelineType.Contains("HDRender"))
-                    throw new Exception("HDRP is not supported.");
-                else
-                    throw new Exception($"Unrecognised render pipeline '{pipelineType}'. Only URP is supported.");
-            }
-            else
-            {
-                throw new Exception("Built-in render pipeline is not supported.");
-            }
+                var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var header = ReadDataHeader(new StreamReader(stream));
+                var body = ReadDataBody(header, new BinaryReader(stream));
+                stream.Close();
 
-            path += "/DefaultPointCloud.mat";
-            return AssetDatabase.LoadAssetAtPath<Material>(path);
+                int count = body.vertices.Count;
+                positions = new Vector3[count];
+                colors = new uint[count];
+
+                for (int i = 0; i < count; i++)
+                {
+                    positions[i] = body.vertices[i];
+                    var c = body.colors[i];
+                    colors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16);
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[PlyImporter] Failed reading {path}: {e.Message}");
+                positions = null;
+                colors = null;
+            }
+        }
+
+        static Material GetDefaultOctreeMaterial()
+        {
+            var path = SHADER_PATH + "URP/DefaultOctreePointCloud.mat";
+            var mat = AssetDatabase.LoadAssetAtPath<Material>(path);
+            if (mat == null)
+                throw new Exception($"Could not find default octree material at '{path}'.");
+            return mat;
+        }
+
+        // Remove legacy sidecar .bin files that used to live next to the .ply in Assets/.
+        // These are no longer written; bins now live in Library/PointCloudBins/.
+        static void DeleteOldSidecarBins(string plyAssetPath)
+        {
+            var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            var baseName    = Path.ChangeExtension(plyAssetPath, null);
+
+            string[] candidates = {
+                Path.Combine(projectRoot, baseName + ".asset.bin"),
+                Path.Combine(projectRoot, baseName + "quality.asset.bin"),
+                Path.Combine(projectRoot, baseName + "performance.asset.bin"),
+            };
+
+            foreach (var full in candidates)
+            {
+                if (!File.Exists(full)) continue;
+                File.Delete(full);
+                var meta = full + ".meta";
+                if (File.Exists(meta)) File.Delete(meta);
+            }
         }
 
         #region Internal data structure
@@ -196,15 +320,14 @@ namespace StoryLabResearch.PointCloud
             )
             {
                 vertices.Add(new Vector3(x, y, z) * rescale);
-                if (USE_ALPHA_FOR_POINT_SIZE_MULTIPLER) a = 1;
                 if (applySRGBCorrection) colors.Add(new Color32(CorrectSRGB(r), CorrectSRGB(g), CorrectSRGB(b), a));
                 else colors.Add(new Color32(r, g, b, a));
             }
 
-            private byte CorrectSRGB(byte val, bool reverse = false)
+            private byte CorrectSRGB(byte val)
             {
                 var floatVal = (float)val / 255;
-                var correctedFloatVal = Mathf.Pow(floatVal, reverse ? 2.2f : 1.0f / 2.2f);
+                var correctedFloatVal = Mathf.Pow(floatVal, 1.0f / 2.2f);
                 return (byte)Mathf.RoundToInt(correctedFloatVal * 255);
             }
         }
@@ -213,73 +336,16 @@ namespace StoryLabResearch.PointCloud
 
         #region Reader implementation
 
-        Mesh ReadDataAsMesh(string path, bool makeReadable)
-        {
-            try
-            {
-                var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                var header = ReadDataHeader(new StreamReader(stream));
-                var body = ReadDataBody(header, new BinaryReader(stream));
-
-                Mesh mesh = new();
-                mesh.name = Path.GetFileNameWithoutExtension(path);
-
-                mesh.indexFormat = header.vertexCount > 65535 ?
-                    IndexFormat.UInt32 : IndexFormat.UInt16;
-
-                mesh.SetVertices(body.vertices);
-                mesh.SetColors(body.colors);
-
-                mesh.SetIndices(
-                    Enumerable.Range(0, header.vertexCount).ToArray(),
-                    MeshTopology.Points, 0
-                );
-
-                stream.Close();
-
-                mesh.UploadMeshData(!makeReadable);
-                return mesh;
-            }
-            catch (Exception e)
-            {
-                Debug.LogError("Failed importing " + path + ". " + e.Message);
-                return null;
-            }
-        }
-
-        BakedPointCloud ReadDataAsBaked(string path, string prefix = "")
-        {
-            try
-            {
-                var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                var header = ReadDataHeader(new StreamReader(stream));
-                var body = ReadDataBody(header, new BinaryReader(stream));
-                var data = ScriptableObject.CreateInstance<BakedPointCloud>();
-                data.Initialize(prefix, body.vertices, body.colors);
-                data.name = prefix + "Data";
-
-                stream.Close();
-                return data;
-            }
-            catch (Exception e)
-            {
-                Debug.LogError("Failed importing " + path + ". " + e.Message);
-                return null;
-            }
-        }
-
         DataHeader ReadDataHeader(StreamReader reader)
         {
             var data = new DataHeader();
             var readCount = 0;
 
-            // Magic number line ("ply")
             var line = reader.ReadLine();
             readCount += line.Length + 1;
             if (line != "ply")
                 throw new ArgumentException("Magic number ('ply') mismatch.");
 
-            // Data format: check if it's binary/little endian.
             line = reader.ReadLine();
             readCount += line.Length + 1;
             if (line != "format binary_little_endian 1.0")
@@ -287,16 +353,13 @@ namespace StoryLabResearch.PointCloud
                     "Invalid data format ('" + line + "'). " +
                     "Should be binary/little endian.");
 
-            // Read header contents.
             for (var skip = false; ;)
             {
-                // Read a line and split it with white space.
                 line = reader.ReadLine();
                 readCount += line.Length + 1;
                 if (line == "end_header") break;
                 var col = line.Split();
 
-                // Element declaration (unskippable)
                 if (col[0] == "element")
                 {
                     if (col[1] == "vertex")
@@ -306,19 +369,16 @@ namespace StoryLabResearch.PointCloud
                     }
                     else
                     {
-                        // Don't read elements other than vertices.
                         skip = true;
                     }
                 }
 
                 if (skip) continue;
 
-                // Property declaration line
                 if (col[0] == "property")
                 {
                     var prop = DataProperty.Invalid;
 
-                    // Parse the property name entry.
                     switch (col[2])
                     {
                         case "red": prop = DataProperty.R8; break;
@@ -330,7 +390,6 @@ namespace StoryLabResearch.PointCloud
                         case "z": prop = DataProperty.SingleZ; break;
                     }
 
-                    // Check the property type.
                     if (col[1] == "char" || col[1] == "uchar" ||
                         col[1] == "int8" || col[1] == "uint8")
                     {
@@ -383,9 +442,7 @@ namespace StoryLabResearch.PointCloud
                 }
             }
 
-            // Rewind the stream back to the exact position of the reader.
             reader.BaseStream.Position = readCount;
-
             return data;
         }
 
@@ -430,27 +487,9 @@ namespace StoryLabResearch.PointCloud
                 data.AddPoint(x, y, z, r, g, b, a, Rescale, ApplySRGBCorrection);
             }
 
-            if (DebugRangeColors)
-            {
-                int colorChangeTracker = 0;
-                int colorChangeInterval = DebugRange;
-                for (int i = 0; i < header.vertexCount; i++)
-                {
-                    if (colorChangeTracker >= colorChangeInterval)
-                    {
-                        colorChangeTracker = 0;
-                        r = (byte)UnityEngine.Random.Range(0, 256);
-                        g = (byte)UnityEngine.Random.Range(0, 256);
-                        b = (byte)UnityEngine.Random.Range(0, 256);
-                    }
-
-                    data.colors[i] = new Color32(r, g, b, data.colors[i].a);
-                    colorChangeTracker++;
-                }
-            }
-
             return data;
         }
         #endregion
     }
+
 }

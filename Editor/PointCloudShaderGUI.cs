@@ -29,11 +29,6 @@ namespace StoryLabResearch.PointCloud
             MaterialProperty _PointShape = FindProperty("_PointShape", properties, false);
             if (_PointShape != null)
                 materialEditor.ShaderProperty(_PointShape, _PointShape.displayName);
-
-            EditorGUILayout.Space();
-
-            MaterialProperty _DebugCrossfade = FindProperty("_Debug", properties);
-            materialEditor.ShaderProperty(_DebugCrossfade, "Debug Crossfade");
         }
     }
 }

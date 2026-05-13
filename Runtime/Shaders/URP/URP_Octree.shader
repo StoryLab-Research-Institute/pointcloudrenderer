@@ -56,7 +56,7 @@ Shader "StoryLab PointCloud/URP Octree"
             float3 _BoundsMin;
             float3 _BoundsSize;
             int   _ActiveOctantMask; // bitmask: bit o set = draw octant o
-            float2 _ScreenExtent;    // precomputed on CPU: abs(P._11_22) * _PointSize * lodScale * 0.5
+            float _LodScale;         // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
 
             // Quad: 4 verts in order TL, BL, BR, TR — matches MeshTopology.Quads winding.
             static const float2 _CornerUV[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
@@ -120,8 +120,18 @@ Shader "StoryLab PointCloud/URP Octree"
 
                 float4 clipPos = TransformWorldToHClip(mul(UNITY_MATRIX_M, float4(pos, 1.0)).xyz);
 
-                // _ScreenExtent is precomputed on CPU: abs(P._11_22) * _PointSize * lodScale * 0.5
-                clipPos.xy += uv * _ScreenExtent;
+                // Compute per-eye extent using the patched stereo projection matrix.
+                // UNITY_MATRIX_P is set per-eye by URP in single-pass instanced mode,
+                // so this is correct for both eyes without any CPU-side per-eye work.
+                float2 screenExtent = float2(
+                    abs(UNITY_MATRIX_P._m00),
+                    abs(UNITY_MATRIX_P._m11)) * _LodScale;
+
+                // 1px minimum: 2/screenHeight in NDC (clip.w ≈ 1 at typical VR distances, close enough).
+                float minExtent = 2.0 / _ScreenParams.y;
+                screenExtent = max(screenExtent, minExtent);
+
+                clipPos.xy += uv * screenExtent;
 
                 o.clipPos = clipPos;
                 o.color   = color; // half3 RGB, no alpha

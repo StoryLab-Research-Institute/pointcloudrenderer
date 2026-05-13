@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using UnityEngine;
 
 namespace StoryLabResearch.PointCloud
@@ -20,7 +19,8 @@ namespace StoryLabResearch.PointCloud
         }
 
         [SerializeField, HideInInspector] private NodeMetadata[] _nodeMetadata;
-        [SerializeField, HideInInspector] private string _dataPath;
+        // Raw point binary data, embedded directly in the asset (no external .bin file).
+        [SerializeField, HideInInspector] private byte[] _pointData;
 
         private OctreeNode[] _nodes;
         private bool _loaded;
@@ -31,22 +31,13 @@ namespace StoryLabResearch.PointCloud
         {
             if (_loaded) return;
             if (_nodeMetadata == null || _nodeMetadata.Length == 0) return;
-
-            var fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", _dataPath));
-            if (!File.Exists(fullPath))
+            if (_pointData == null || _pointData.Length == 0)
             {
-                Debug.LogError($"[OctreeAsset] Point data file not found: {fullPath}");
+                Debug.LogError($"[OctreeAsset] '{name}' has no embedded point data.");
                 return;
             }
 
-            byte[] fileBytes;
-            try { fileBytes = File.ReadAllBytes(fullPath); }
-            catch (Exception e)
-            {
-                Debug.LogError($"[OctreeAsset] Failed to read point data: {e.Message}");
-                return;
-            }
-
+            var fileBytes = _pointData;
             int count = _nodeMetadata.Length;
             _nodes = new OctreeNode[count];
 
@@ -57,11 +48,11 @@ namespace StoryLabResearch.PointCloud
                 _nodes[i] = new OctreeNode
                 {
                     Bounds = meta.Bounds,
-                    Depth = meta.Depth,
+                    Depth  = meta.Depth,
                 };
             }
 
-            // Second pass: wire up children. ChildIndices[o] = node index for octant o, -1 = absent.
+            // Second pass: wire up children.
             for (int i = 0; i < count; i++)
             {
                 var childIndices = _nodeMetadata[i].ChildIndices;
@@ -75,7 +66,6 @@ namespace StoryLabResearch.PointCloud
                     for (int o = 0; o < 8; o++)
                         _nodes[i].Children[o] = childIndices[o] >= 0 ? _nodes[childIndices[o]] : null;
                 }
-                // Children stays null for leaves.
             }
 
             // Third pass: build merged GPU buffers.
@@ -83,20 +73,19 @@ namespace StoryLabResearch.PointCloud
             //   word0 = (uint16_y << 16) | uint16_x  — XY quantized relative to node bounds
             //   word1 = RGB24 in bits 0-23            — octant (0-7) injected into bits 24-26 at load time
             //   word2 = uint16_z in bits 0-15         — Z quantized, upper 16 bits spare
-            // colLen is always 0 in this format; colour is fused into word1.
             int fileOffset = 0;
             for (int i = 0; i < count; i++)
             {
                 var meta = _nodeMetadata[i];
                 var node = _nodes[i];
 
-                node.OctantPointCounts = new int[8];
+                node.OctantPointCounts    = new int[8];
                 node.OctantOriginalCounts = new int[8];
 
                 int total = 0;
                 for (int o = 0; o < 8; o++)
                 {
-                    node.OctantPointCounts[o] = meta.OctantPointCounts[o];
+                    node.OctantPointCounts[o]    = meta.OctantPointCounts[o];
                     node.OctantOriginalCounts[o] = meta.OctantOriginalCounts != null
                         ? meta.OctantOriginalCounts[o]
                         : meta.OctantPointCounts[o];
@@ -111,15 +100,13 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                // Compute per-octant file offsets (OctantColLengths are 0 in the new format).
                 var octantFileOffsets = new int[8];
                 octantFileOffsets[0] = fileOffset;
                 for (int o = 1; o < 8; o++)
                     octantFileOffsets[o] = octantFileOffsets[o - 1]
                         + meta.OctantPosLengths[o - 1] + meta.OctantColLengths[o - 1];
 
-                // Merge octants into one buffer, injecting octant index into word1 bits 24-26.
-                var packed = new uint[total * 3];
+                var packed   = new uint[total * 3];
                 int writeIdx = 0;
                 for (int o = 0; o < 8; o++)
                 {
@@ -128,7 +115,7 @@ namespace StoryLabResearch.PointCloud
 
                     if (pts > 0 && posLen > 0)
                     {
-                        int base_ = octantFileOffsets[o];
+                        int  base_      = octantFileOffsets[o];
                         uint octantBits = (uint)o << 24;
                         for (int p = 0; p < pts; p++)
                         {
@@ -148,7 +135,7 @@ namespace StoryLabResearch.PointCloud
 
                 var bn = meta.Bounds;
                 node.PropertyBlock = new MaterialPropertyBlock();
-                node.PropertyBlock.SetBuffer("_Points", node.PointBuffer);
+                node.PropertyBlock.SetBuffer("_Points",     node.PointBuffer);
                 node.PropertyBlock.SetVector("_BoundsMin",  new Vector4(bn.min.x,  bn.min.y,  bn.min.z,  0));
                 node.PropertyBlock.SetVector("_BoundsSize", new Vector4(bn.size.x, bn.size.y, bn.size.z, 0));
             }
@@ -161,7 +148,7 @@ namespace StoryLabResearch.PointCloud
             if (!_loaded || _nodes == null) return;
             foreach (var node in _nodes)
                 node.ReleaseBuffers();
-            _nodes = null;
+            _nodes  = null;
             _loaded = false;
         }
 
@@ -170,35 +157,35 @@ namespace StoryLabResearch.PointCloud
         {
             public Bounds Bounds;
             public int Depth;
-            public int[] OctantPointCounts;    // [8] — kept after subsampling
-            public int[] OctantOriginalCounts; // [8] — before subsampling
-            public int[] OctantPosLengths;     // [8]
-            public int[] OctantColLengths;     // [8]
-            public int[] ChildIndices;         // [8], -1 = absent
+            public int[] OctantPointCounts;
+            public int[] OctantOriginalCounts;
+            public int[] OctantPosLengths;
+            public int[] OctantColLengths;
+            public int[] ChildIndices;
         }
 
-        public void SetDataFromPublic(PublicNodeMetadata[] metadata, string dataPath)
+        public void SetData(PublicNodeMetadata[] metadata, byte[] pointData)
         {
-            _dataPath = dataPath;
-            int count = metadata.Length;
+            _pointData = pointData;
+            int count  = metadata.Length;
             _nodeMetadata = new NodeMetadata[count];
 
             for (int i = 0; i < count; i++)
             {
                 _nodeMetadata[i] = new NodeMetadata
                 {
-                    Bounds = metadata[i].Bounds,
-                    Depth = metadata[i].Depth,
-                    OctantPointCounts = metadata[i].OctantPointCounts,
+                    Bounds               = metadata[i].Bounds,
+                    Depth                = metadata[i].Depth,
+                    OctantPointCounts    = metadata[i].OctantPointCounts,
                     OctantOriginalCounts = metadata[i].OctantOriginalCounts,
-                    OctantPosLengths = metadata[i].OctantPosLengths,
-                    OctantColLengths = metadata[i].OctantColLengths,
-                    ChildIndices = metadata[i].ChildIndices,
+                    OctantPosLengths     = metadata[i].OctantPosLengths,
+                    OctantColLengths     = metadata[i].OctantColLengths,
+                    ChildIndices         = metadata[i].ChildIndices,
                 };
             }
 
             _loaded = false;
-            _nodes = null;
+            _nodes  = null;
         }
 
         private void OnDisable()

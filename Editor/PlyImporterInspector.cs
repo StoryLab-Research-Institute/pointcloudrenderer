@@ -7,91 +7,150 @@ namespace StoryLabResearch.PointCloud
     [CustomEditor(typeof(PlyImporter))]
     public class PlyImporterInspector : ScriptedImporterEditor
     {
+        SerializedProperty _axisPreset;
+        SerializedProperty _axisX;
+        SerializedProperty _axisY;
+        SerializedProperty _axisZ;
         SerializedProperty _rescale;
         SerializedProperty _applySRGBCorrection;
+        SerializedProperty _importProperties;
+        SerializedProperty _quality;
+        SerializedProperty _performance;
 
-        SerializedProperty _containerType;
-        string[] _containerTypeNames;
-
-        SerializedProperty _subsampleMode;
-        SerializedProperty _subsampleValue;
-
-        SerializedProperty _materialMode;
-        SerializedProperty _customMaterialOverride;
-        SerializedProperty _extractUniqueMaterial;
-
-        SerializedProperty _debugRangeColors;
-        GUIContent _debugRangeLabel = new("Debug Range");
-        SerializedProperty _debugRange;
+        bool _qualityFoldout     = true;
+        bool _performanceFoldout = true;
 
         public override void OnEnable()
         {
             base.OnEnable();
 
-            _rescale = serializedObject.FindProperty(nameof(PlyImporter.Rescale));
+            _axisPreset          = serializedObject.FindProperty(nameof(PlyImporter.AxisPreset));
+            _axisX               = serializedObject.FindProperty(nameof(PlyImporter.AxisX));
+            _axisY               = serializedObject.FindProperty(nameof(PlyImporter.AxisY));
+            _axisZ               = serializedObject.FindProperty(nameof(PlyImporter.AxisZ));
+            _rescale             = serializedObject.FindProperty(nameof(PlyImporter.Rescale));
             _applySRGBCorrection = serializedObject.FindProperty(nameof(PlyImporter.ApplySRGBCorrection));
-
-            _containerType = serializedObject.FindProperty(nameof(PlyImporter.ContainerType));
-            _containerTypeNames = System.Enum.GetNames(typeof(PlyImporter.EAssetContainerType));
-
-            _subsampleMode = serializedObject.FindProperty(nameof(PlyImporter.SubsampleMode));
-            _subsampleValue = serializedObject.FindProperty(nameof(PlyImporter.SubsampleValue));
-
-            _materialMode = serializedObject.FindProperty(nameof(PlyImporter.MaterialMode));
-            _customMaterialOverride = serializedObject.FindProperty(nameof(PlyImporter.CustomMaterialOverride));
-            _extractUniqueMaterial = serializedObject.FindProperty(nameof(PlyImporter.ExtractUniqueMaterial));
-
-            _debugRangeColors = serializedObject.FindProperty(nameof(PlyImporter.DebugRangeColors));
-            _debugRange = serializedObject.FindProperty(nameof(PlyImporter.DebugRange));
+            _importProperties    = serializedObject.FindProperty(nameof(PlyImporter.ImportProperties));
+            _quality             = serializedObject.FindProperty(nameof(PlyImporter.Quality));
+            _performance         = serializedObject.FindProperty(nameof(PlyImporter.Performance));
         }
 
         public override void OnInspectorGUI()
         {
-            EditorGUILayout.PropertyField(_rescale);
-            EditorGUILayout.PropertyField(_applySRGBCorrection);
+            EditorGUILayout.LabelField("Coordinates", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(_axisPreset, new GUIContent("Axis Preset",
+                "Maps PLY axes to Unity world axes. Most photogrammetry and LiDAR tools export Z-up right-handed."));
 
-            _containerType.intValue = EditorGUILayout.Popup(
-                "Container Type", _containerType.intValue, _containerTypeNames);
-
-            EditorGUILayout.Space();
-
-            if (_containerType.intValue == (int)PlyImporter.EAssetContainerType.PointMesh)
+            var preset = (PlyImporter.EAxisPreset)_axisPreset.intValue;
+            if (preset == PlyImporter.EAxisPreset.Custom)
             {
-                EditorGUILayout.PropertyField(_subsampleMode);
-                if (_subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.Random)
-                    _subsampleValue.floatValue = EditorGUILayout.Slider("Subsample Factor", _subsampleValue.floatValue, 0f, 1f);
-                else if (_subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialFast
-                      || _subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialThreePass
-                      || _subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialExact)
-                    _subsampleValue.floatValue = EditorGUILayout.FloatField("Minimum Distance", Mathf.Max(_subsampleValue.floatValue, 0f));
-
-                EditorGUILayout.Space();
-
-                EditorGUILayout.PropertyField(_materialMode);
-                switch (_materialMode.intValue)
+                EditorGUI.indentLevel++;
+                EditorGUILayout.PropertyField(_axisX, new GUIContent("Unity +X  ←  PLY"));
+                EditorGUILayout.PropertyField(_axisY, new GUIContent("Unity +Y  ←  PLY"));
+                EditorGUILayout.PropertyField(_axisZ, new GUIContent("Unity +Z  ←  PLY"));
+                EditorGUI.indentLevel--;
+            }
+            else
+            {
+                // Show the resolved mapping as a read-only hint.
+                string mapping = preset switch
                 {
-                    case (int)PlyImporter.EMaterialMode.Unique:
-                        EditorGUILayout.HelpBox("Create a unique material for this asset.\r\n\r\nBy default the material will be extracted to allow you to edit its properties. The extracted material will not be destroyed if you choose later not to extract it.", MessageType.Info);
-                        EditorGUILayout.PropertyField(_extractUniqueMaterial);
-                        break;
-                    case (int)PlyImporter.EMaterialMode.Custom:
-                        EditorGUILayout.HelpBox("Apply a custom user-selected material to this asset.\r\n\r\nThis can allow you to share a material with custom properties across many point cloud assets for better rendering efficiency.", MessageType.Info);
-                        EditorGUILayout.PropertyField(_customMaterialOverride);
-                        break;
-                    default:
-                        EditorGUILayout.HelpBox("Use the default shared point cloud rendering material, for more efficient rendering if you do not need to edit material properties.\r\n\r\nEditing the default material will affect all current and future point cloud assets set to this mode, and should be avoided - if you need custom properties, create a custom material instead.", MessageType.Warning);
-                        break;
-                }
+                    PlyImporter.EAxisPreset.ZUpRightHanded => "Unity (+X, +Y, +Z)  ←  PLY (−X, +Z, +Y)",
+                    PlyImporter.EAxisPreset.ZUpLeftHanded  => "Unity (+X, +Y, +Z)  ←  PLY (+X, +Z, +Y)",
+                    PlyImporter.EAxisPreset.YUpRightHanded => "Unity (+X, +Y, +Z)  ←  PLY (+X, +Y, −Z)",
+                    _                                      => "Pass-through — PLY axes used as-is",
+                };
+                EditorGUILayout.HelpBox(mapping, MessageType.None);
             }
 
+            EditorGUILayout.PropertyField(_rescale);
+            EditorGUILayout.PropertyField(_applySRGBCorrection);
             EditorGUILayout.Space();
 
-            EditorGUILayout.PropertyField(_debugRangeColors);
-            if (_debugRangeColors.boolValue)
-                _debugRange.intValue = Mathf.Max(0, EditorGUILayout.IntField(_debugRangeLabel, _debugRange.intValue));
+            EditorGUILayout.PropertyField(_importProperties,
+                new GUIContent("Import Properties",
+                    "Optional shared import properties asset. When set, all settings below are ignored."));
+
+            if (_importProperties.objectReferenceValue != null)
+            {
+                EditorGUILayout.HelpBox(
+                    "Settings are driven by the Import Properties asset above. " +
+                    "Clear it to use per-asset inline settings.",
+                    MessageType.Info);
+            }
+            else
+            {
+                EditorGUILayout.Space();
+                DrawTierSection("Quality  (PC / Mac / Consoles)", _quality, ref _qualityFoldout);
+                EditorGUILayout.Space();
+                DrawTierSection("Performance  (Android / Quest)", _performance, ref _performanceFoldout);
+            }
 
             serializedObject.ApplyModifiedProperties();
             ApplyRevertGUI();
+        }
+
+        private void DrawTierSection(string label, SerializedProperty tier, ref bool foldout)
+        {
+            foldout = EditorGUILayout.BeginFoldoutHeaderGroup(foldout, label);
+            if (foldout)
+            {
+                EditorGUI.indentLevel++;
+
+                EditorGUILayout.LabelField("Point Processing", EditorStyles.boldLabel);
+                var spacingProp = tier.FindPropertyRelative(nameof(PlatformImportTier.MinPointSpacing));
+                float newSpacing = EditorGUILayout.FloatField(
+                    new GUIContent("Min Point Spacing",
+                        "Cull points closer together than this world-space distance. 0 = disabled."),
+                    spacingProp.floatValue);
+                spacingProp.floatValue = Mathf.Max(0f, newSpacing);
+
+                EditorGUILayout.Space();
+
+                EditorGUILayout.LabelField("Material", EditorStyles.boldLabel);
+                var modeProp = tier.FindPropertyRelative(nameof(PlatformImportTier.MaterialMode));
+                EditorGUILayout.PropertyField(modeProp, new GUIContent("Mode"));
+
+                var matProp = tier.FindPropertyRelative(nameof(PlatformImportTier.Material));
+                var mode = (PointCloudImportProperties.EMaterialMode)modeProp.intValue;
+                switch (mode)
+                {
+                    case PointCloudImportProperties.EMaterialMode.Shared:
+                        EditorGUILayout.PropertyField(matProp,
+                            new GUIContent("Material", "Used directly. Leave empty for the pipeline default."));
+                        EditorGUILayout.HelpBox(
+                            "The material reference is used as-is. Edits affect every cloud sharing it.",
+                            MessageType.None);
+                        break;
+                    case PointCloudImportProperties.EMaterialMode.Instantiated:
+                        EditorGUILayout.PropertyField(matProp,
+                            new GUIContent("Source Material", "Material to copy. Leave empty for the pipeline default."));
+                        EditorGUILayout.HelpBox(
+                            "A copy is embedded inside this asset. Edit it via the sub-asset in the Project window.",
+                            MessageType.None);
+                        break;
+                    case PointCloudImportProperties.EMaterialMode.Extracted:
+                        EditorGUILayout.PropertyField(matProp,
+                            new GUIContent("Source Material", "Material to copy. Leave empty for the pipeline default."));
+                        EditorGUILayout.HelpBox(
+                            "A copy is written as a standalone .mat file next to the .ply. " +
+                            "Assign it as the Shared material on other clouds to reuse it.",
+                            MessageType.None);
+                        break;
+                }
+
+                EditorGUILayout.Space();
+
+                EditorGUILayout.LabelField("Render Properties", EditorStyles.boldLabel);
+                var renderProp = tier.FindPropertyRelative(nameof(PlatformImportTier.RenderProperties));
+                EditorGUILayout.PropertyField(renderProp,
+                    new GUIContent("Render Properties",
+                        "Render settings applied to the imported OctreeRenderer for this tier. " +
+                        "Leave unset to use OctreeRenderer built-in defaults."));
+
+                EditorGUI.indentLevel--;
+            }
+            EditorGUILayout.EndFoldoutHeaderGroup();
         }
     }
 }

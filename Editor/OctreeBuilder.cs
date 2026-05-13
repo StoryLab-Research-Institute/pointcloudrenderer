@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using UnityEditor;
 using UnityEngine;
 
@@ -13,88 +12,79 @@ namespace StoryLabResearch.PointCloud
         private const int TargetPointsPerOctant = 2048;
         private const int MaxDepth = 12;
 
-        [MenuItem("Assets/StoryLab PointCloud/Build Octree from Mesh")]
-        private static void BuildOctreeFromSelection()
+        // Build an OctreeAsset from raw point data without registering it with AssetDatabase —
+        // the caller
+        // (e.g. a ScriptedImporter) is responsible for embedding it as a sub-asset.
+        // binPath is a project-relative path for the companion .bin file.
+        public static OctreeAsset BuildFromPointsEmbedded(
+            Vector3[] positions, uint[] colors,
+            float minPointSpacing = 0f)
         {
-            var mesh = Selection.activeObject as Mesh;
-            if (mesh == null)
-            {
-                EditorUtility.DisplayDialog("Build Octree", "Select a Mesh asset first.", "OK");
-                return;
-            }
-            BuildFromMesh(mesh, Matrix4x4.identity);
-        }
-
-        [MenuItem("Assets/StoryLab PointCloud/Build Octree from Mesh", true)]
-        private static bool BuildOctreeFromSelectionValidate() => Selection.activeObject is Mesh;
-
-        public static OctreeAsset BuildFromMesh(Mesh mesh, Matrix4x4 localToWorld)
-        {
-            var savePath = EditorUtility.SaveFilePanelInProject(
-                "Save Octree Asset", mesh.name + "_Octree", "asset", "Save octree asset");
-            if (string.IsNullOrEmpty(savePath)) return null;
-
             try
             {
-                EditorUtility.DisplayProgressBar("Building Octree", "Reading mesh data...", 0f);
-
-                var localVerts = mesh.vertices;
-                var colors32 = mesh.colors32;
-                int totalPoints = localVerts.Length;
-
-                var positions = new Vector3[totalPoints];
-                var colors = new uint[totalPoints];
-
-                for (int i = 0; i < totalPoints; i++)
-                {
-                    positions[i] = localToWorld.MultiplyPoint3x4(localVerts[i]);
-                    if (colors32 != null && colors32.Length == totalPoints)
-                    {
-                        var c = colors32[i];
-                        colors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16) | ((uint)c.a << 24);
-                    }
-                    else
-                    {
-                        colors[i] = 0xFFFFFFFF;
-                    }
-                }
-
-                var rootBounds = ComputeBounds(positions, 0, totalPoints);
-                EditorUtility.DisplayProgressBar("Building Octree", "Building tree...", 0.05f);
-
-                var indices = new int[totalPoints];
-                for (int i = 0; i < totalPoints; i++) indices[i] = i;
-
-                var nodeMetaList = new List<OctreeAsset.PublicNodeMetadata>();
-                var binChunks = new List<byte[]>(); // flat list of per-octant byte chunks in node order
-
-                BuildNode(positions, colors, indices, 0, totalPoints,
-                    rootBounds, 0, nodeMetaList, binChunks, totalPoints);
-
-                EditorUtility.DisplayProgressBar("Building Octree", "Writing point data...", 0.92f);
-
-                var binPath = Path.ChangeExtension(savePath, null) + ".asset.bin";
-                var binFullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", binPath));
-
-                using (var fs = new FileStream(binFullPath, FileMode.Create, FileAccess.Write))
-                    foreach (var chunk in binChunks)
-                        if (chunk != null) fs.Write(chunk, 0, chunk.Length);
-
-                EditorUtility.DisplayProgressBar("Building Octree", "Creating asset...", 0.97f);
-
-                var asset = ScriptableObject.CreateInstance<OctreeAsset>();
-                asset.SetDataFromPublic(nodeMetaList.ToArray(), binPath);
-
-                AssetDatabase.CreateAsset(asset, savePath);
-                AssetDatabase.SaveAssets();
-
-                Debug.Log($"[OctreeBuilder] Built {nodeMetaList.Count} nodes from {totalPoints} points.");
-                return asset;
+                return BuildOctreeInternal(positions, colors, minPointSpacing);
             }
             finally
             {
                 EditorUtility.ClearProgressBar();
             }
+        }
+
+        private static OctreeAsset BuildOctreeInternal(
+            Vector3[] positions, uint[] colors,
+            float minPointSpacing)
+        {
+            int totalPoints = positions.Length;
+
+            int[] indices;
+            if (minPointSpacing > 0f)
+            {
+                EditorUtility.DisplayProgressBar("Building Octree", "Pre-thinning points...", 0.02f);
+                var preBounds = ComputeBounds(positions, 0, totalPoints);
+                var allIndices = new int[totalPoints];
+                for (int i = 0; i < totalPoints; i++) allIndices[i] = i;
+                indices = GlobalGridSubsample(positions, allIndices, preBounds, minPointSpacing);
+                Debug.Log($"[OctreeBuilder] Pre-thin: {totalPoints} → {indices.Length} points " +
+                          $"(spacing {minPointSpacing:F4}m).");
+                totalPoints = indices.Length;
+            }
+            else
+            {
+                indices = new int[totalPoints];
+                for (int i = 0; i < totalPoints; i++) indices[i] = i;
+            }
+
+            EditorUtility.DisplayProgressBar("Building Octree", "Building tree...", 0.05f);
+
+            var rootBounds   = ComputeBoundsFromIndices(positions, indices);
+            var nodeMetaList = new List<OctreeAsset.PublicNodeMetadata>();
+            var binChunks    = new List<byte[]>();
+
+            BuildNode(positions, colors, indices, 0, totalPoints,
+                rootBounds, 0, nodeMetaList, binChunks, totalPoints);
+
+            EditorUtility.DisplayProgressBar("Building Octree", "Assembling point data...", 0.92f);
+
+            int totalBytes = 0;
+            foreach (var chunk in binChunks)
+                if (chunk != null) totalBytes += chunk.Length;
+            var pointData = new byte[totalBytes];
+            int writePos  = 0;
+            foreach (var chunk in binChunks)
+            {
+                if (chunk == null) continue;
+                Buffer.BlockCopy(chunk, 0, pointData, writePos, chunk.Length);
+                writePos += chunk.Length;
+            }
+
+            EditorUtility.DisplayProgressBar("Building Octree", "Creating asset...", 0.97f);
+
+            var asset = ScriptableObject.CreateInstance<OctreeAsset>();
+            asset.name = "OctreeAsset";
+            asset.SetData(nodeMetaList.ToArray(), pointData);
+
+            Debug.Log($"[OctreeBuilder] Built {nodeMetaList.Count} nodes, {totalBytes / 1024 / 1024} MB embedded.");
+            return asset;
         }
 
         private static void BuildNode(
@@ -270,6 +260,44 @@ namespace StoryLabResearch.PointCloud
             var b = new Bounds();
             b.SetMinMax(min, max);
             return b;
+        }
+
+        private static Bounds ComputeBoundsFromIndices(Vector3[] positions, int[] indices)
+        {
+            if (indices.Length == 0) return new Bounds();
+            var min = positions[indices[0]];
+            var max = positions[indices[0]];
+            for (int i = 1; i < indices.Length; i++)
+            {
+                min = Vector3.Min(min, positions[indices[i]]);
+                max = Vector3.Max(max, positions[indices[i]]);
+            }
+            var b = new Bounds();
+            b.SetMinMax(min, max);
+            return b;
+        }
+
+        // Global grid subsample: one cell of size minSpacing across the whole cloud.
+        // Keeps the first point that falls into each cell — O(n) with a hash set.
+        private static int[] GlobalGridSubsample(Vector3[] positions, int[] indices, Bounds bounds, float minSpacing)
+        {
+            var cellOccupied = new HashSet<long>(indices.Length / 4);
+            var result = new List<int>(indices.Length);
+            var bMin = bounds.min;
+            float inv = 1f / minSpacing;
+
+            for (int i = 0; i < indices.Length; i++)
+            {
+                var p = positions[indices[i]] - bMin;
+                long cx = (long)(p.x * inv);
+                long cy = (long)(p.y * inv);
+                long cz = (long)(p.z * inv);
+                // Cantor-style hash robust to large coordinate values.
+                long key = cx * 2_000_003L + cy * 1_999_979L + cz;
+                if (cellOccupied.Add(key))
+                    result.Add(indices[i]);
+            }
+            return result.ToArray();
         }
 
         private static void WritePointData(Vector3[] positions, uint[] colors, int[] indices,

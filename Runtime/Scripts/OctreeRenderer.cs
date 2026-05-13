@@ -11,42 +11,145 @@ namespace StoryLabResearch.PointCloud
     [ExecuteAlways]
     public class OctreeRenderer : MonoBehaviour
     {
-        [SerializeField] private OctreeAsset _asset;
-        [SerializeField] private Material _material;
-        [SerializeField] private int PointBudget = 2_000_000;
+        public enum EPlatformOverride { Auto, Quality, Performance }
 
-        [Tooltip("Stop refining a node when its angular size (extents / distance / tan(halfFov)) drops below this. " +
-                 "Higher values cull distant nodes more aggressively. Try 0.1–0.5. Default 0.2.")]
-        [SerializeField] private float ScreenErrorThreshold = 0.2f;
+        [SerializeField] private PerPlatformAssets _assets;
+        [SerializeField] private PerPlatformMaterials _materials;
 
-        [Tooltip("Skip drawing nodes whose screen error is below this fraction of ScreenErrorThreshold. " +
-                 "Culls sub-pixel nodes that contribute overdraw with no visual benefit. 0 = disabled.")]
-        [SerializeField] private float MinDrawErrorFraction = 0.1f;
+        [Tooltip("Auto: selects Quality on PC/Mac/consoles, Performance on Android/Quest. " +
+                 "Override to force a specific tier for debugging.")]
+        [SerializeField] private EPlatformOverride PlatformOverride = EPlatformOverride.Auto;
 
-        [Tooltip("Global point size multiplier. Tune visually — the per-node scale is derived from the subsampling ratio, so this just sets the overall base size.")]
-        [SerializeField] private float PointSizeScale = 1.0f;
+        [Tooltip("Per-platform render properties. The correct tier is selected automatically " +
+                 "based on the current platform (or PlatformOverride).")]
+        [SerializeField] private PerPlatformRenderProperties SharedRenderProperties;
 
         [Tooltip("In edit mode, follow the scene view camera instead of Camera.main.")]
         [SerializeField] private bool UseSceneCameraInEditMode = true;
 
-        [Tooltip("Reduces LOD detail towards the screen periphery, concentrating the point budget near the gaze point. " +
-                 "0 = disabled. Higher values = more aggressive peripheral culling.")]
-        [SerializeField] private float FoveationStrength = 0f;
+        [Tooltip("Multiplier on the render properties PointBudget.")]
+        public float PointBudgetMultiplier = 1f;
 
-        [Tooltip("Normalised viewport radius inside which foveation has no effect (full fidelity zone). " +
-                 "0 = no inner window, penalty starts at centre. 0.5 = half the screen width. Default 0.1.")]
-        [Range(0f, 0.5f)]
-        [SerializeField] private float FoveationInnerRadius = 0.1f;
+        [Tooltip("Multiplier on the render properties PointSizeScale.")]
+        public float PointSizeMultiplier = 1f;
 
-        [Tooltip("Normalised viewport radius at which the full FoveationStrength penalty is reached. " +
-                 "Must be >= FoveationInnerRadius. 0.5 = screen edge. Default 0.5.")]
-        [Range(0f, 0.5f)]
-        [SerializeField] private float FoveationOuterRadius = 0.5f;
+        [Tooltip("Multiplier on the render properties ScreenErrorThreshold. " +
+                 "Increase to reduce detail (coarser LOD), decrease for more detail.")]
+        public float ScreenErrorMultiplier = 1f;
+
+        [Tooltip("Multiplier on the render properties MinDrawErrorFraction.")]
+        public float MinDrawErrorMultiplier = 1f;
+
+        // Resolves the active tier based on the override setting and runtime platform.
+        private EPlatformTier ActiveTier
+        {
+            get
+            {
+                if (PlatformOverride == EPlatformOverride.Quality)     return EPlatformTier.Quality;
+                if (PlatformOverride == EPlatformOverride.Performance) return EPlatformTier.Performance;
+                return Application.platform == RuntimePlatform.Android
+                    ? EPlatformTier.Performance
+                    : EPlatformTier.Quality;
+            }
+        }
+
+        private OctreeAsset ActiveAsset   => _assets.Resolve(ActiveTier);
+        private Material    ActiveMaterial => _materials.Resolve(ActiveTier);
+
+#if UNITY_EDITOR
+        // Called by PlyImporter to wire up assets and materials on the prefab.
+        public void SetImportedAsset(PerPlatformAssets assets, PerPlatformMaterials materials,
+            PerPlatformRenderProperties renderProperties = default)
+        {
+            _assets                = assets;
+            _materials             = materials;
+            SharedRenderProperties = renderProperties;
+        }
+
+        // Build processor access — get/set the full struct and restore individual slots.
+        public PerPlatformRenderProperties SharedRenderPropertiesForBuild
+        {
+            get => SharedRenderProperties;
+            set => SharedRenderProperties = value;
+        }
+
+        public PerPlatformAssets AssetsForBuild
+        {
+            get => _assets;
+            set => _assets = value;
+        }
+
+        public void RestoreQualityRenderProperties(PointCloudRenderProperties so)
+        {
+            SharedRenderProperties = new PerPlatformRenderProperties
+            {
+                Quality     = new LazyLoadReference<PointCloudRenderProperties>(so),
+                Performance = SharedRenderProperties.Performance,
+            };
+        }
+
+        public void RestorePerformanceRenderProperties(PointCloudRenderProperties so)
+        {
+            SharedRenderProperties = new PerPlatformRenderProperties
+            {
+                Quality     = SharedRenderProperties.Quality,
+                Performance = new LazyLoadReference<PointCloudRenderProperties>(so),
+            };
+        }
+
+        public void RestoreQualityAsset(OctreeAsset asset)
+        {
+            _assets = new PerPlatformAssets
+            {
+                Quality     = asset,
+                Performance = _assets.Performance,
+            };
+        }
+
+        public void RestorePerformanceAsset(OctreeAsset asset)
+        {
+            _assets = new PerPlatformAssets
+            {
+                Quality     = _assets.Quality,
+                Performance = asset,
+            };
+        }
+#endif
+
+        private PointCloudRenderProperties ActiveProperties => SharedRenderProperties.Resolve(ActiveTier);
+
+        // Fallback values used when no render properties SO is assigned.
+        private const int   DefaultPointBudget          = 2_000_000;
+        private const float DefaultScreenErrorThreshold = 0.2f;
+        private const float DefaultMinDrawErrorFraction = 0.1f;
+        private const float DefaultPointSizeScale       = 1.0f;
+
+        private int   P_PointBudget          => Mathf.Max(1, Mathf.RoundToInt(
+                                                    (ActiveProperties?.PointBudget ?? DefaultPointBudget)
+                                                    * PointBudgetMultiplier));
+        private float P_ScreenErrorThreshold => (ActiveProperties?.ScreenErrorThreshold ?? DefaultScreenErrorThreshold)
+                                                    * ScreenErrorMultiplier;
+        private float P_MinDrawErrorFraction => (ActiveProperties?.MinDrawErrorFraction ?? DefaultMinDrawErrorFraction)
+                                                    * MinDrawErrorMultiplier;
+        private float P_PointSizeScale       => (ActiveProperties?.PointSizeScale     ?? DefaultPointSizeScale)
+                                                    * PointSizeMultiplier;
+        private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
+        private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
+        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 2f;
+        private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.1f;
+        private float P_FoveationOuterRadius => ActiveProperties?.FoveationOuterRadius    ?? 0.5f;
 
 
         private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
-        private static readonly int PropScreenExtent     = Shader.PropertyToID("_ScreenExtent");
+        private static readonly int PropLodScale         = Shader.PropertyToID("_LodScale");
         private static readonly int PropPointSize        = Shader.PropertyToID("_PointSize");
+
+        // CullingGroup state — rebuilt whenever the asset or camera changes.
+        private CullingGroup      _cullingGroup;
+        private OctreeNode[]      _cullingNodes;   // parallel to _cullingSpheres
+        private BoundingSphere[]  _cullingSpheres;
+        private Camera            _cullingCamera;  // camera the group is currently bound to
+        private HashSet<OctreeNode> _occludedNodes = new();
 
         private readonly List<NodeDrawable> _activeDrawables  = new();
         private readonly List<NodeDrawable> _pendingDrawables = new();
@@ -77,7 +180,9 @@ namespace StoryLabResearch.PointCloud
             UnityEditor.EditorApplication.update -= EditorTick;
 #endif
             DeregisterAll();
-            _asset?.Unload();
+            DisposeCullingGroup();
+            _assets.Quality?.Unload();
+            _assets.Performance?.Unload();
         }
 
 #if UNITY_EDITOR
@@ -90,15 +195,21 @@ namespace StoryLabResearch.PointCloud
 
         private void Update()
         {
-            _asset?.Load();
-            if (_asset?.Root == null) return;
+            var asset = ActiveAsset;
+            asset?.Load();
+            if (asset?.Root == null) return;
 
             var cam = ResolveCamera();
             if (cam == null) return;
 
+            if (P_OcclusionCulling)
+                RefreshCullingGroup(cam, asset);
+            else
+                DisposeCullingGroup();
+
             _pendingDrawables.Clear();
             _poolCursor = 0;
-            SelectNodes(cam);
+            SelectNodes(cam, asset);
 
             DeregisterAll();
             foreach (var d in _pendingDrawables)
@@ -120,29 +231,93 @@ namespace StoryLabResearch.PointCloud
             return Camera.main;
         }
 
-        private void SelectNodes(Camera cam)
+        // ----- Occlusion culling (CullingGroup) -----
+
+        private void RefreshCullingGroup(Camera cam, OctreeAsset asset)
+        {
+            // Rebuild if asset changed, camera changed, or group not yet created.
+            bool needRebuild = _cullingGroup == null
+                || _cullingCamera != cam
+                || _cullingNodes == null
+                || _cullingNodes.Length == 0;
+
+            if (needRebuild)
+            {
+                DisposeCullingGroup();
+
+                // Collect every node in the tree into a flat list.
+                var nodes = new List<OctreeNode>();
+                CollectNodes(asset.Root, nodes);
+
+                _cullingNodes   = nodes.ToArray();
+                _cullingSpheres = new BoundingSphere[_cullingNodes.Length];
+
+                var localToWorld = transform.localToWorldMatrix;
+                for (int i = 0; i < _cullingNodes.Length; i++)
+                {
+                    var wb = TransformBounds(_cullingNodes[i].Bounds, localToWorld);
+                    _cullingSpheres[i] = new BoundingSphere(wb.center, wb.extents.magnitude);
+                }
+
+                _cullingGroup = new CullingGroup();
+                _cullingGroup.targetCamera = cam;
+                _cullingGroup.SetBoundingSpheres(_cullingSpheres);
+                _cullingGroup.SetBoundingSphereCount(_cullingSpheres.Length);
+                _cullingCamera = cam;
+            }
+
+            // Keep the distance reference point current — required for occlusion to activate.
+            _cullingGroup.SetDistanceReferencePoint(cam.transform.position);
+
+            // Query which spheres are not visible (failed frustum OR occlusion).
+            // Frustum culling is already handled in HeapPush, so double-culling is harmless.
+            // Note: occlusion culling is only active in player builds — in the editor only
+            // frustum culling is applied by CullingGroup.
+            _occludedNodes.Clear();
+            int[] results = new int[_cullingNodes.Length];
+            int hiddenCount = _cullingGroup.QueryIndices(false, results, 0);
+            for (int i = 0; i < hiddenCount; i++)
+                _occludedNodes.Add(_cullingNodes[results[i]]);
+        }
+
+        private void DisposeCullingGroup()
+        {
+            _cullingGroup?.Dispose();
+            _cullingGroup  = null;
+            _cullingCamera = null;
+            _cullingNodes  = null;
+            _cullingSpheres = null;
+            _occludedNodes.Clear();
+        }
+
+        private static void CollectNodes(OctreeNode node, List<OctreeNode> result)
+        {
+            if (node == null) return;
+            result.Add(node);
+            if (node.Children == null) return;
+            for (int o = 0; o < 8; o++)
+                CollectNodes(node.Children[o], result);
+        }
+
+        private void SelectNodes(Camera cam, OctreeAsset asset)
         {
             var localToWorld = transform.localToWorldMatrix;
             float halfFovTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
-            // Precompute screen extent factor: abs(P._11_22) * _PointSize * 0.5
-            // lodScale is per-node and multiplied in below, so fold everything else
-            // into a base extent and scale it per node before passing as _ScreenExtent.
-            var proj = cam.projectionMatrix;
-            float pointSize = _material.GetFloat(PropPointSize) * PointSizeScale * 0.5f;
-            var screenExtentBase = new Vector2(
-                Mathf.Abs(proj.m00) * pointSize,
-                Mathf.Abs(proj.m11) * pointSize);
+            // _LodScale = _PointSize * lodScale * 0.5 — the projection factors are applied
+            // per-eye in the shader using UNITY_MATRIX_P, so the CPU only supplies the scale.
+            var mat = ActiveMaterial;
+            float pointSizeBase = mat.GetFloat(PropPointSize) * P_PointSizeScale * 0.5f;
 
             // Max-heap: enqueue nodes sorted by screen error (largest first).
             // Pop nodes one at a time; if within budget and above error threshold, expand children.
             // Otherwise, mark node as selected (frontier).
             _heap.Clear();
             _selectedNodes.Clear();
-            HeapPush(_asset.Root, null, cam, halfFovTan, localToWorld);
+            HeapPush(asset.Root, null, cam, halfFovTan, localToWorld);
 
-            int remaining = PointBudget;
+            int remaining = P_PointBudget;
             while (_heap.Count > 0)
             {
                 var entry = HeapPop();
@@ -158,7 +333,7 @@ namespace StoryLabResearch.PointCloud
 
                 // HeapError = ScreenError / foveationScale, so comparing against the base threshold
                 // is equivalent to comparing ScreenError against threshold * foveationScale.
-                bool tooSmall    = entry.HeapError < ScreenErrorThreshold;
+                bool tooSmall    = entry.HeapError < P_ScreenErrorThreshold;
                 bool outOfBudget = remaining <= 0;
 
                 if (tooSmall || outOfBudget || node.IsLeaf)
@@ -177,7 +352,7 @@ namespace StoryLabResearch.PointCloud
             }
 
             // Emit one draw call per selected node.
-            float minDrawError = ScreenErrorThreshold * MinDrawErrorFraction;
+            float minDrawError = P_ScreenErrorThreshold * P_MinDrawErrorFraction;
             foreach (var kvp in _selectedNodes)
             {
                 var node       = kvp.Key;
@@ -186,7 +361,7 @@ namespace StoryLabResearch.PointCloud
                 if (node.TotalPointCount == 0) continue;
 
                 // Skip nodes too small to contribute visibly — reduces overdraw from tiny distant nodes.
-                if (MinDrawErrorFraction > 0 && screenError < minDrawError) continue;
+                if (P_MinDrawErrorFraction > 0 && screenError < minDrawError) continue;
 
                 // Build active octant bitmask: skip octants whose child is also selected.
                 int activeMask = 0;
@@ -210,22 +385,21 @@ namespace StoryLabResearch.PointCloud
 
                 // sqrt(ratio) converts point-count ratio to linear size ratio (area ∝ size²).
                 float ratio    = totalOrig > 0 ? (float)totalOrig / totalKept : 1f;
-                float lodScale = Mathf.Sqrt(ratio);
+                float lodScale = Mathf.Sqrt(ratio) * pointSizeBase;
 
-                // Scale the precomputed base extent by this node's lodScale.
-                var screenExtent = screenExtentBase * lodScale;
-
-                _pendingDrawables.Add(GetDrawable(node, _material, localToWorld, activeMask, totalKept, screenExtent));
+                _pendingDrawables.Add(GetDrawable(node, mat, localToWorld, activeMask, totalKept, lodScale));
             }
         }
 
         // ----- Foveation scale -----
 
-        // Returns the foveation threshold multiplier (>= 1) for a node given its viewport-space
-        // centre and its raw screen error (used to shrink the projected centre toward screen centre).
+        // Returns (FoveationStrength+1)^t where t is the node's normalised peripheral position [0,1].
+        // Dividing rawError by this gives heapError: peripheral nodes are deprioritised exponentially,
+        // so doubling strength compounds rather than adding. t uses the bounds-extent correction so a
+        // large node covering screen centre isn't penalised because its centre projects off-axis.
         private float FoveationScale(Vector3 worldCenter, float rawError, Camera cam, float halfFovTan)
         {
-            if (FoveationStrength <= 0f) return 1f;
+            if (!P_FoveationEnabled || P_FoveationStrength <= 0f) return 1f;
             var vp = cam.WorldToViewportPoint(worldCenter);
             if (vp.z <= 0f) return 1f; // behind camera — no penalty
 
@@ -234,10 +408,10 @@ namespace StoryLabResearch.PointCloud
             float dx = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.x, 0f, 1f) - 0.5f) - screenHalfH);
             float dy = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.y, 0f, 1f) - 0.5f) - screenHalfV) * cam.aspect;
             float r  = Mathf.Max(dx, dy);
-            float outer = Mathf.Max(FoveationOuterRadius, FoveationInnerRadius + 0.001f);
-            float t = Mathf.Clamp01((r - FoveationInnerRadius) / (outer - FoveationInnerRadius));
+            float outer = Mathf.Max(P_FoveationOuterRadius, P_FoveationInnerRadius + 0.001f);
+            float t = Mathf.Clamp01((r - P_FoveationInnerRadius) / (outer - P_FoveationInnerRadius));
             t = t * t * (3f - 2f * t); // smoothstep
-            return 1f + FoveationStrength * t;
+            return Mathf.Pow(P_FoveationStrength + 1f, t);
         }
 
         // ----- Heap push/pop (max-heap on foveation-adjusted ScreenError) -----
@@ -247,6 +421,7 @@ namespace StoryLabResearch.PointCloud
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
             if (!GeometryUtility.TestPlanesAABB(_frustumPlanes, worldBounds)) return;
+            if (P_OcclusionCulling && _occludedNodes.Contains(node)) return;
 
             // Distance to nearest point on the AABB, so nodes the camera is inside or
             // behind don't get an inflated screen error and consume the entire point budget.
@@ -260,8 +435,8 @@ namespace StoryLabResearch.PointCloud
                 ? worldBounds.extents.magnitude / dist / halfFovTan
                 : float.MaxValue;
 
-            // Divide raw error by foveation scale so peripheral nodes sort lower in the heap
-            // and get expanded after central nodes. This ensures budget runs out in the right order.
+            // heapError = rawError / (strength+1)^t — exponential peripheral penalty so
+            // budget runs out in screen-position order, not just distance order.
             float fovScale   = FoveationScale(worldBounds.center, rawError, cam, halfFovTan);
             float heapError  = rawError / fovScale;
 
@@ -304,7 +479,7 @@ namespace StoryLabResearch.PointCloud
         // ----- NodeDrawable pool -----
 
         private NodeDrawable GetDrawable(OctreeNode node, Material material,
-            Matrix4x4 localToWorld, int activeMask, int vertCount, Vector2 screenExtent)
+            Matrix4x4 localToWorld, int activeMask, int vertCount, float lodScale)
         {
             NodeDrawable d;
             if (_poolCursor < _drawablePool.Count)
@@ -317,7 +492,7 @@ namespace StoryLabResearch.PointCloud
                 _drawablePool.Add(d);
                 _poolCursor++;
             }
-            d.Set(node, material, localToWorld, activeMask, vertCount, screenExtent);
+            d.Set(node, material, localToWorld, activeMask, vertCount, lodScale);
             return d;
         }
 
@@ -363,25 +538,25 @@ namespace StoryLabResearch.PointCloud
             private Material   _material;
             private Matrix4x4  _localToWorld;
             private int        _activeMask;
-            private int        _vertCount;    // totalKept * 4 (Quads)
-            private Vector2    _screenExtent; // precomputed: abs(P._11_22) * _PointSize * lodScale * 0.5
+            private int        _vertCount;  // totalKept * 4 (Quads)
+            private float      _lodScale;   // _PointSize * sqrt(orig/kept) * 0.5 — projection applied per-eye in shader
 
             public void Set(OctreeNode node, Material material,
-                Matrix4x4 localToWorld, int activeMask, int vertCount, Vector2 screenExtent)
+                Matrix4x4 localToWorld, int activeMask, int vertCount, float lodScale)
             {
                 _node         = node;
                 _material     = material;
                 _localToWorld = localToWorld;
                 _activeMask   = activeMask;
                 _vertCount    = vertCount * 4;
-                _screenExtent = screenExtent;
+                _lodScale     = lodScale;
             }
 
             public void Draw(RasterCommandBuffer cmd)
             {
                 var block = _node.PropertyBlock;
                 block.SetInt(PropActiveOctantMask, _activeMask);
-                block.SetVector(PropScreenExtent,  new Vector4(_screenExtent.x, _screenExtent.y, 0, 0));
+                block.SetFloat(PropLodScale, _lodScale);
                 cmd.DrawProcedural(_localToWorld, _material, 0,
                     MeshTopology.Quads, _vertCount, 1, block);
             }
