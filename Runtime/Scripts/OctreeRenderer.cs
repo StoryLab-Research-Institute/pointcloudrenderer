@@ -44,11 +44,29 @@ namespace StoryLabResearch.PointCloud
         private readonly List<QueueEntry> _queue = new();
         private readonly Dictionary<OctreeNode, float> _selectedNodes = new();
 
+        private void OnEnable()
+        {
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.update += EditorTick;
+#endif
+        }
+
         private void OnDisable()
         {
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.update -= EditorTick;
+#endif
             DeregisterAll();
             _asset?.Unload();
         }
+
+#if UNITY_EDITOR
+        private void EditorTick()
+        {
+            if (this == null || Application.isPlaying) return;
+            Update();
+        }
+#endif
 
         private void Update()
         {
