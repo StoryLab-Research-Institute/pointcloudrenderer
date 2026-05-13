@@ -89,19 +89,21 @@ Shader "StoryLab PointCloud/URP Octree"
 
             v2f vert(a2v input)
             {
+                // Fetch and octant-cull before initialising output registers — reduces register
+                // pressure on tile GPUs (Quest) where most vertices are culled by the mask.
+                uint3 pt     = _Points[input.vertexID / 4];
+                uint  octant = (pt.y >> 24) & 0x7u;
+                if ((_ActiveOctantMask & (1u << octant)) == 0u)
+                {
+                    v2f o;
+                    ZERO_INITIALIZE(v2f, o);
+                    UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+                    return o; // SV_POSITION = (0,0,0,0) → degenerate, clipped for free
+                }
+
                 v2f o;
                 ZERO_INITIALIZE(v2f, o);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
-
-                uint pointIdx = input.vertexID / 4;
-
-                // Single fetch: position + color + octant in one uint3 (12 bytes, one cache line).
-                uint3 pt = _Points[pointIdx];
-
-                // Octant in bits 24-26 of pt.y — check mask before any ALU work.
-                uint octant = (pt.y >> 24) & 0x7u;
-                if ((_ActiveOctantMask & (1u << octant)) == 0u)
-                    return o; // SV_POSITION = (0,0,0,0) → degenerate, clipped for free
 
                 float2 uv = _CornerUV[input.vertexID % 4];
 

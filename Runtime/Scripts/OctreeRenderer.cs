@@ -148,14 +148,14 @@ namespace StoryLabResearch.PointCloud
         private CullingGroup      _cullingGroup;
         private OctreeNode[]      _cullingNodes;   // parallel to _cullingSpheres
         private BoundingSphere[]  _cullingSpheres;
+        private int[]             _cullingResults; // reused buffer for QueryIndices
         private Camera            _cullingCamera;  // camera the group is currently bound to
-        private HashSet<OctreeNode> _occludedNodes = new();
+        private readonly HashSet<OctreeNode> _occludedNodes = new();
 
         private readonly List<NodeDrawable> _activeDrawables  = new();
         private readonly List<NodeDrawable> _pendingDrawables = new();
 
-        // Min-heap ordered by ascending ScreenError (we pop the max, so we invert on insert).
-        // We use a flat List<QueueEntry> as a max-heap (largest ScreenError = highest priority).
+        // Max-heap on HeapError — highest error (largest, most visible) node is popped first.
         private readonly List<QueueEntry> _heap = new();
 
         private readonly Dictionary<OctreeNode, float> _selectedNodes = new();
@@ -263,6 +263,7 @@ namespace StoryLabResearch.PointCloud
                 _cullingGroup.targetCamera = cam;
                 _cullingGroup.SetBoundingSpheres(_cullingSpheres);
                 _cullingGroup.SetBoundingSphereCount(_cullingSpheres.Length);
+                _cullingResults = new int[_cullingSpheres.Length];
                 _cullingCamera = cam;
             }
 
@@ -274,29 +275,35 @@ namespace StoryLabResearch.PointCloud
             // Note: occlusion culling is only active in player builds — in the editor only
             // frustum culling is applied by CullingGroup.
             _occludedNodes.Clear();
-            int[] results = new int[_cullingNodes.Length];
-            int hiddenCount = _cullingGroup.QueryIndices(false, results, 0);
+            int hiddenCount = _cullingGroup.QueryIndices(false, _cullingResults, 0);
             for (int i = 0; i < hiddenCount; i++)
-                _occludedNodes.Add(_cullingNodes[results[i]]);
+                _occludedNodes.Add(_cullingNodes[_cullingResults[i]]);
         }
 
         private void DisposeCullingGroup()
         {
             _cullingGroup?.Dispose();
-            _cullingGroup  = null;
-            _cullingCamera = null;
-            _cullingNodes  = null;
+            _cullingGroup   = null;
+            _cullingCamera  = null;
+            _cullingNodes   = null;
             _cullingSpheres = null;
+            _cullingResults = null;
             _occludedNodes.Clear();
         }
 
-        private static void CollectNodes(OctreeNode node, List<OctreeNode> result)
+        private static void CollectNodes(OctreeNode root, List<OctreeNode> result)
         {
-            if (node == null) return;
-            result.Add(node);
-            if (node.Children == null) return;
-            for (int o = 0; o < 8; o++)
-                CollectNodes(node.Children[o], result);
+            if (root == null) return;
+            var stack = new Stack<OctreeNode>();
+            stack.Push(root);
+            while (stack.Count > 0)
+            {
+                var node = stack.Pop();
+                result.Add(node);
+                if (node.Children == null) continue;
+                for (int o = 0; o < 8; o++)
+                    if (node.Children[o] != null) stack.Push(node.Children[o]);
+            }
         }
 
         private void SelectNodes(Camera cam, OctreeAsset asset)
@@ -440,7 +447,7 @@ namespace StoryLabResearch.PointCloud
             float fovScale   = FoveationScale(worldBounds.center, rawError, cam, halfFovTan);
             float heapError  = rawError / fovScale;
 
-            var entry = new QueueEntry(node, parent, worldBounds.center, rawError, heapError);
+            var entry = new QueueEntry(node, parent, rawError, heapError);
             _heap.Add(entry);
             // Sift up on HeapError.
             int i = _heap.Count - 1;
@@ -521,13 +528,12 @@ namespace StoryLabResearch.PointCloud
         private readonly struct QueueEntry
         {
             public readonly OctreeNode Node;
-            public readonly OctreeNode Parent;   // fallback if Node isn't loaded yet
-            public readonly Vector3 WorldCenter; // world-space bounds centre
-            public readonly float ScreenError;   // raw geometric error, used for LOD size scale
-            public readonly float HeapError;     // ScreenError / foveationScale, used for heap ordering and stop test
-            public QueueEntry(OctreeNode node, OctreeNode parent, Vector3 worldCenter, float screenError, float heapError)
+            public readonly OctreeNode Parent;  // fallback if Node isn't loaded yet
+            public readonly float ScreenError;  // raw geometric error, used for LOD size scale
+            public readonly float HeapError;    // ScreenError / foveationScale, used for heap ordering and stop test
+            public QueueEntry(OctreeNode node, OctreeNode parent, float screenError, float heapError)
             {
-                Node = node; Parent = parent; WorldCenter = worldCenter; ScreenError = screenError; HeapError = heapError;
+                Node = node; Parent = parent; ScreenError = screenError; HeapError = heapError;
             }
         }
 
