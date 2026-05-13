@@ -1,5 +1,3 @@
-using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEditor.AssetImporters;
 using UnityEditor;
@@ -15,23 +13,12 @@ namespace StoryLabResearch.PointCloud
         SerializedProperty _containerType;
         string[] _containerTypeNames;
 
-        SerializedProperty _initialSubsampleMode;
-        SerializedProperty _initialSubsampleValue;
+        SerializedProperty _subsampleMode;
+        SerializedProperty _subsampleValue;
 
         SerializedProperty _materialMode;
         SerializedProperty _customMaterialOverride;
         SerializedProperty _extractUniqueMaterial;
-
-        SerializedProperty _generateChunks;
-        SerializedProperty _chunkSize;
-
-        SerializedProperty _generateLODs;
-        GUIContent _generateLODsLabel = new("Generate LODs");
-        SerializedProperty _crossFadeLODs;
-        GUIContent _crossFadeLODsLabel = new("CrossFade LODs");
-        SerializedProperty _fastLODGeneration;
-        GUIContent _fastLODGenerationLabel = new("Fast LOD Generation");
-        SerializedProperty _lodDescriptions;
 
         SerializedProperty _debugRangeColors;
         GUIContent _debugRangeLabel = new("Debug Range");
@@ -47,20 +34,12 @@ namespace StoryLabResearch.PointCloud
             _containerType = serializedObject.FindProperty(nameof(PlyImporter.ContainerType));
             _containerTypeNames = System.Enum.GetNames(typeof(PlyImporter.EAssetContainerType));
 
-            _initialSubsampleMode = serializedObject.FindProperty(nameof(PlyImporter.InitialSubsampleMode));
-            _initialSubsampleValue = serializedObject.FindProperty(nameof(PlyImporter.SubsampleValue));
+            _subsampleMode = serializedObject.FindProperty(nameof(PlyImporter.SubsampleMode));
+            _subsampleValue = serializedObject.FindProperty(nameof(PlyImporter.SubsampleValue));
 
             _materialMode = serializedObject.FindProperty(nameof(PlyImporter.MaterialMode));
             _customMaterialOverride = serializedObject.FindProperty(nameof(PlyImporter.CustomMaterialOverride));
             _extractUniqueMaterial = serializedObject.FindProperty(nameof(PlyImporter.ExtractUniqueMaterial));
-
-            _generateChunks = serializedObject.FindProperty(nameof(PlyImporter.GenerateChunks));
-            _chunkSize = serializedObject.FindProperty(nameof(PlyImporter.ChunkSize));
-
-            _generateLODs = serializedObject.FindProperty(nameof(PlyImporter.GenerateLODs));
-            _crossFadeLODs = serializedObject.FindProperty(nameof(PlyImporter.CrossFadeLODs));
-            _fastLODGeneration = serializedObject.FindProperty(nameof(PlyImporter.FastLODGeneration));
-            _lodDescriptions = serializedObject.FindProperty(nameof(PlyImporter.LODDescriptions));
 
             _debugRangeColors = serializedObject.FindProperty(nameof(PlyImporter.DebugRangeColors));
             _debugRange = serializedObject.FindProperty(nameof(PlyImporter.DebugRange));
@@ -69,8 +48,8 @@ namespace StoryLabResearch.PointCloud
         public override void OnInspectorGUI()
         {
             EditorGUILayout.PropertyField(_rescale);
-
             EditorGUILayout.PropertyField(_applySRGBCorrection);
+
             _containerType.intValue = EditorGUILayout.Popup(
                 "Container Type", _containerType.intValue, _containerTypeNames);
 
@@ -78,32 +57,18 @@ namespace StoryLabResearch.PointCloud
 
             if (_containerType.intValue == (int)PlyImporter.EAssetContainerType.PointMesh)
             {
-                EditorGUILayout.PropertyField(_initialSubsampleMode);
-                if (_initialSubsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.Random) _initialSubsampleValue.floatValue = EditorGUILayout.Slider("Subsample Factor", _initialSubsampleValue.floatValue, 0f, 1f);
-                else if (_initialSubsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialFast 
-                      || _initialSubsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialThreePass
-                      || _initialSubsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialExact)
-                    _initialSubsampleValue.floatValue = EditorGUILayout.FloatField("Minimum Distance", Mathf.Max(_initialSubsampleValue.floatValue, 0f));
-
-                EditorGUILayout.Space();
-
-                EditorGUILayout.PropertyField(_generateChunks);
-                if (_generateChunks.boolValue) EditorGUILayout.PropertyField(_chunkSize);
-
-                EditorGUILayout.Space();
-
-                EditorGUILayout.PropertyField(_generateLODs, _generateLODsLabel);
-                if (_generateLODs.boolValue)
-                {
-                    EditorGUILayout.PropertyField(_crossFadeLODs, _crossFadeLODsLabel);
-                    EditorGUILayout.PropertyField(_fastLODGeneration, _fastLODGenerationLabel);
-                    EditorGUILayout.PropertyField(_lodDescriptions);
-                }
+                EditorGUILayout.PropertyField(_subsampleMode);
+                if (_subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.Random)
+                    _subsampleValue.floatValue = EditorGUILayout.Slider("Subsample Factor", _subsampleValue.floatValue, 0f, 1f);
+                else if (_subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialFast
+                      || _subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialThreePass
+                      || _subsampleMode.intValue == (int)PointMeshSubsampler.ESubsampleMode.SpatialExact)
+                    _subsampleValue.floatValue = EditorGUILayout.FloatField("Minimum Distance", Mathf.Max(_subsampleValue.floatValue, 0f));
 
                 EditorGUILayout.Space();
 
                 EditorGUILayout.PropertyField(_materialMode);
-                switch(_materialMode.intValue)
+                switch (_materialMode.intValue)
                 {
                     case (int)PlyImporter.EMaterialMode.Unique:
                         EditorGUILayout.HelpBox("Create a unique material for this asset.\r\n\r\nBy default the material will be extracted to allow you to edit its properties. The extracted material will not be destroyed if you choose later not to extract it.", MessageType.Info);
@@ -122,7 +87,8 @@ namespace StoryLabResearch.PointCloud
             EditorGUILayout.Space();
 
             EditorGUILayout.PropertyField(_debugRangeColors);
-            if(_debugRangeColors.boolValue) _debugRange.intValue = Mathf.Max(0, EditorGUILayout.IntField(_debugRangeLabel, _debugRange.intValue));
+            if (_debugRangeColors.boolValue)
+                _debugRange.intValue = Mathf.Max(0, EditorGUILayout.IntField(_debugRangeLabel, _debugRange.intValue));
 
             serializedObject.ApplyModifiedProperties();
             ApplyRevertGUI();

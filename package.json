@@ -1,8 +1,8 @@
 {
-  "name": "com.storylabresearch.pointcloudrenderer",
-  "version": "0.0.1",
-  "displayName": "StoryLabResearch PointCloud Renderer",
-  "description": "Importer, chunker and LOD generator with PCX-based importing and rendering mechanisms for PLY pointcloud files",
+  "name": "com.storylabresearch.pointcloudrenderer.octree",
+  "version": "0.1.0",
+  "displayName": "StoryLabResearch PointCloud Renderer (Octree)",
+  "description": "Octree-based point cloud renderer for large-scale point clouds. Streaming-ready hierarchical LOD with budget-based traversal, StructuredBuffer rendering (no geometry shader), and cross-platform support including Android/Quest.",
   "unity": "2022.3",
   "unityRelease": "5f1",
   "author": {

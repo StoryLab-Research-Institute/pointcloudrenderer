@@ -9,49 +9,18 @@ using System.Linq;
 
 namespace StoryLabResearch.PointCloud
 {
-    [System.Serializable]
-    public class LODDescription
-    {
-        public PointMeshSubsampler.ESubsampleMode SubsampleMode = PointMeshSubsampler.ESubsampleMode.None;
-        public float SubsampleValue = 1f;
-        [Range(0f, 1f)] public float ScreenRelativeTransitionHeight = .2f;
-        [Range(0f, 1f)] public float FadeTransitionWidth = .1f;
-        public bool CompensateArea = true;
-    }
-
-    [ScriptedImporter(1, "ply")]
+    [ScriptedImporter(2, "ply")]
     class PlyImporter : ScriptedImporter
     {
-        public PlyImporter()
-        {
-            LODDescriptions = new LODDescription[]
-            {
-                new() { SubsampleMode = PointMeshSubsampler.ESubsampleMode.None, SubsampleValue = 0f, ScreenRelativeTransitionHeight = 0.7f, FadeTransitionWidth = 0.1f },
-                new() { SubsampleMode = PointMeshSubsampler.ESubsampleMode.SpatialFast, SubsampleValue = 0.02f, ScreenRelativeTransitionHeight = 0.1f, FadeTransitionWidth = 0.1f },
-                new() { SubsampleMode = PointMeshSubsampler.ESubsampleMode.SpatialFast, SubsampleValue = 0.1f, ScreenRelativeTransitionHeight = 0.05f, FadeTransitionWidth = 0.1f },
-                new() { SubsampleMode = PointMeshSubsampler.ESubsampleMode.SpatialFast, SubsampleValue = 0.5f, ScreenRelativeTransitionHeight = 0.005f, FadeTransitionWidth = 0.1f }
-            };
-            GenerateLODs = true;
-        }
         public enum EAssetContainerType { PointMesh, BakedTexture }
         public enum EMaterialMode { Unique, Custom, ShareDefault }
-
-        #region ScriptedImporter implementation
 
         public float Rescale = 1.0f;
         public bool ApplySRGBCorrection;
         public EAssetContainerType ContainerType = EAssetContainerType.PointMesh;
 
-        public PointMeshSubsampler.ESubsampleMode InitialSubsampleMode = PointMeshSubsampler.ESubsampleMode.None;
+        public PointMeshSubsampler.ESubsampleMode SubsampleMode = PointMeshSubsampler.ESubsampleMode.None;
         public float SubsampleValue = 1f;
-
-        public bool GenerateChunks = true;
-        public float ChunkSize = 5f;
-
-        public bool GenerateLODs = true;
-        public bool CrossFadeLODs = false;
-        public bool FastLODGeneration = true;
-        public LODDescription[] LODDescriptions;
 
         public EMaterialMode MaterialMode = EMaterialMode.Unique;
         public Material CustomMaterialOverride;
@@ -60,12 +29,10 @@ namespace StoryLabResearch.PointCloud
         public bool DebugRangeColors = false;
         public int DebugRange = 13429;
 
-        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer/runtime/shaders/";
-        //public static readonly string SHADER_PATH = "assets/pointcloudrenderer/runtime/shaders/";
+        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.octree/runtime/shaders/";
 
         private const bool USE_ALPHA_FOR_POINT_SIZE_MULTIPLER = true;
         // shader uses alpha as a point size multiplier
-        // The only reason this is a const is to make it really obvious what I'm doing here
 
         public override void OnImportAsset(AssetImportContext context)
         {
@@ -96,48 +63,47 @@ namespace StoryLabResearch.PointCloud
 
         private void ImportAsPointMesh(AssetImportContext context)
         {
+            var mesh = ReadDataAsMesh(context.assetPath, false);
+            if (mesh == null) return;
+
+            if (SubsampleMode != PointMeshSubsampler.ESubsampleMode.None)
+                mesh = PointMeshSubsampler.SubsampleMesh(SubsampleMode, mesh, mesh.name, SubsampleValue);
+
+            var material = GetAndAddMaterial(context, mesh.name);
+
             var rootGameObject = new GameObject();
+            rootGameObject.name = mesh.name;
 
-            Mesh plyMesh = GetPlyMesh(context);
-            Material material = GetAndAddMaterial(context, plyMesh.name);
-            CreateAndAddMeshObjects(context, rootGameObject, material, plyMesh);
+            var meshFilter = rootGameObject.AddComponent<MeshFilter>();
+            meshFilter.sharedMesh = mesh;
 
+            var meshRenderer = rootGameObject.AddComponent<MeshRenderer>();
+            meshRenderer.sharedMaterial = material;
+
+            context.AddObjectToAsset("mesh", mesh);
             context.AddObjectToAsset("prefab", rootGameObject);
             context.SetMainObject(rootGameObject);
         }
 
-        #endregion
-
-        #region Internal utilities
-
-        private Mesh GetPlyMesh(AssetImportContext context)
-        {
-            var plyMesh = ReadDataAsMesh(context.assetPath, false);
-            if (InitialSubsampleMode != PointMeshSubsampler.ESubsampleMode.None) plyMesh = PointMeshSubsampler.SubsampleMesh(InitialSubsampleMode, plyMesh, plyMesh.name, SubsampleValue);
-            return plyMesh;
-        }
-
         private Material GetAndAddMaterial(AssetImportContext context, string name)
         {
-            Material material;
             switch (MaterialMode)
             {
                 case EMaterialMode.Unique:
-                    material = new(GetPipelineSpecificDefaultMaterial().shader);
+                    var material = new Material(GetPipelineSpecificDefaultMaterial().shader);
                     material.name = name;
-                    if (ExtractUniqueMaterial) AssetDatabase.CreateAsset(material, Path.Combine(Path.GetDirectoryName(context.assetPath), Path.GetFileName(context.assetPath) + ".mat"));
-                    else context.AddObjectToAsset("Unique Material", material);
-                    break;
+                    if (ExtractUniqueMaterial)
+                        AssetDatabase.CreateAsset(material, Path.Combine(Path.GetDirectoryName(context.assetPath), Path.GetFileName(context.assetPath) + ".mat"));
+                    else
+                        context.AddObjectToAsset("Unique Material", material);
+                    return material;
 
                 case EMaterialMode.Custom:
-                    material = CustomMaterialOverride;
-                    break;
+                    return CustomMaterialOverride;
 
                 default:
-                    material = GetPipelineSpecificDefaultMaterial();
-                    break;
+                    return GetPipelineSpecificDefaultMaterial();
             }
-            return material;
         }
 
         static Material GetPipelineSpecificDefaultMaterial()
@@ -146,130 +112,22 @@ namespace StoryLabResearch.PointCloud
 
             if (GraphicsSettings.currentRenderPipeline != null)
             {
-                if (GraphicsSettings.currentRenderPipeline.name.Contains("URP"))
-                {
+                var pipelineType = GraphicsSettings.currentRenderPipeline.GetType().FullName;
+                if (pipelineType.Contains("Universal"))
                     path += "URP";
-                }
-                else if (GraphicsSettings.currentRenderPipeline.name.Contains("HDRP"))
-                {
-                    throw new Exception("Current Scriptable Render Pipeline is HDRP, which is not currently supported!");
-                    //path += "HDRP";
-                }
+                else if (pipelineType.Contains("HighDefinition") || pipelineType.Contains("HDRender"))
+                    throw new Exception("HDRP is not supported.");
                 else
-                {
-                    throw new Exception("Graphics settings contains a Scriptable Render Pipeline, but it is not URP or HDRP! Aborting");
-                }
+                    throw new Exception($"Unrecognised render pipeline '{pipelineType}'. Only URP is supported.");
             }
             else
             {
-                throw new Exception("BRP shaders have not yet been brought up to parity with URP ones - sorry!");
-                //path += "BRP";
+                throw new Exception("Built-in render pipeline is not supported.");
             }
 
             path += "/DefaultPointCloud.mat";
-
             return AssetDatabase.LoadAssetAtPath<Material>(path);
         }
-
-        private void CreateAndAddMeshObjects(AssetImportContext context, GameObject rootGameObject, Material material, Mesh plyMesh)
-        {
-            Mesh[] meshes;
-            if (GenerateChunks) meshes = PointMeshChunker.ChunkPointMesh(plyMesh, Vector3.zero, ChunkSize);
-            else meshes = new Mesh[] { plyMesh };
-
-            foreach (var mesh in meshes)
-            {
-                var gameObject = new GameObject();
-                gameObject.transform.parent = rootGameObject.transform;
-                gameObject.name = mesh.name;
-
-                if (GenerateLODs) CreateAndAddLODGroupObject(context, mesh, material, gameObject, LODDescriptions, CrossFadeLODs, FastLODGeneration);
-                else CreateAndAddSingleMeshObject(context, material, mesh, gameObject);
-
-                context.AddObjectToAsset(mesh.name + " object", gameObject);
-            }
-        }
-
-        private static void CreateAndAddSingleMeshObject(AssetImportContext context, Material material, Mesh mesh, GameObject gameObject)
-        {
-            var meshFilter = gameObject.AddComponent<MeshFilter>();
-            meshFilter.sharedMesh = mesh;
-
-            var meshRenderer = gameObject.AddComponent<MeshRenderer>();
-            meshRenderer.sharedMaterial = material;
-
-            context.AddObjectToAsset(mesh.name, mesh);
-        }
-
-        private void CreateAndAddLODGroupObject(AssetImportContext context, Mesh mesh, Material material, GameObject gameObject, LODDescription[] lodDescriptions, bool crossFadeLODs, bool fastLODGeneration)
-        {
-            var lodGroup = gameObject.AddComponent<LODGroup>();
-
-            var LODs = CreateAndAddLODRenderers(context, mesh, material, gameObject, lodDescriptions, fastLODGeneration);
-
-            lodGroup.SetLODs(LODs);
-            lodGroup.fadeMode = crossFadeLODs ? LODFadeMode.CrossFade : LODFadeMode.None;
-        }
-
-        private LOD[] CreateAndAddLODRenderers(AssetImportContext context, Mesh mesh, Material material, GameObject gameObject, LODDescription[] lodDescriptions, bool fastLODGeneration)
-        {
-            LODDescription[] OrderedLODDescriptions = OrderLODDescriptionsIfNecessary(lodDescriptions);
-            var LODs = new LOD[OrderedLODDescriptions.Length];
-            var workingMesh = mesh;
-            var referencePointCount = mesh.vertexCount;
-
-            for (int i = 0; i < lodDescriptions.Length; i++)
-            {
-                Mesh subsampledMesh = PointMeshSubsampler.SubsampleMesh(OrderedLODDescriptions[i].SubsampleMode, workingMesh, mesh.name + "_LOD" + i, OrderedLODDescriptions[i].SubsampleValue, referencePointCount, true);
-                context.AddObjectToAsset(subsampledMesh.name, subsampledMesh);
-                LODs[i] = CreateAddAndReturnLODRendererObject(context, gameObject, subsampledMesh, OrderedLODDescriptions[i], material);
-
-                if (fastLODGeneration) workingMesh = subsampledMesh; // use the already subsampled output mesh as the start point for the next LOD level
-            }
-
-            return LODs;
-        }
-
-        private LODDescription[] OrderLODDescriptionsIfNecessary(LODDescription[] lodDescriptions)
-        {
-            LODDescription[] orderedLODDescriptions = lodDescriptions;
-            for (int i = 1; i < lodDescriptions.Length; i++)
-            {
-                if (lodDescriptions[i].ScreenRelativeTransitionHeight > lodDescriptions[i - 1].ScreenRelativeTransitionHeight)
-                {
-                    Debug.LogWarning("LOD Descriptions are not in transition size order, reordering...");
-                    orderedLODDescriptions = lodDescriptions.OrderByDescending(o => o.ScreenRelativeTransitionHeight).ToArray();
-                    break;
-                }
-            }
-            return orderedLODDescriptions;
-        }
-
-        private LOD CreateAddAndReturnLODRendererObject(AssetImportContext context, GameObject gameObject, Mesh subsampledMesh, LODDescription description, Material material)
-        {
-            var subGameObject = new GameObject();
-            subGameObject.transform.parent = gameObject.transform;
-            subGameObject.name = subsampledMesh.name;
-
-            var meshFilter = subGameObject.AddComponent<MeshFilter>();
-            meshFilter.sharedMesh = subsampledMesh;
-
-            var meshRenderer = subGameObject.AddComponent<MeshRenderer>();
-            meshRenderer.sharedMaterial = material;
-
-            var LOD = new LOD
-            {
-                screenRelativeTransitionHeight = description.ScreenRelativeTransitionHeight,
-                fadeTransitionWidth = description.FadeTransitionWidth,
-                renderers = new Renderer[] { meshRenderer }
-            };
-
-            context.AddObjectToAsset(subsampledMesh.name + " object", subGameObject);
-
-            return LOD;
-        }
-
-        #endregion
 
         #region Internal data structure
         // https://github.com/keijiro/Pcx

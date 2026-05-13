@@ -1,3 +1,7 @@
 {
-	"name": "RuntimeScripts"
+	"name": "RuntimeScripts",
+	"references": [
+		"Unity.RenderPipelines.Universal.Runtime",
+		"Unity.RenderPipelines.Core.Runtime"
+	]
 }
