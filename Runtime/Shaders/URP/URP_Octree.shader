@@ -10,8 +10,10 @@ required, no fallback path needed.
 Points are driven via DrawProcedural from OctreeRenderer. Each draw call
 covers one octree node; _Points is set per-node via MaterialPropertyBlock.
 
-_Points is a StructuredBuffer<uint4>: xyz = position floats (asuint reinterpret),
-w = (octant[3]<<29) | (alpha5[5]<<24) | RGB[24]. One 16-byte cache-line fetch per point.
+_Points is a StructuredBuffer<uint3> (12 bytes/point):
+  .x = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
+  .y = (octant[3] << 24) | RGB24    — octant in bits 24-26, RGB in bits 0-23
+  .z = uint16_z in bits 0-15        — Z quantized [0,65535]
 */
 
 Shader "StoryLab PointCloud/URP Octree"
