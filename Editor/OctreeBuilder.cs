@@ -281,7 +281,7 @@ namespace StoryLabResearch.PointCloud
             //   .z = uint16_z in low 16 bits       — Z quantized to node bounds, upper 16 spare
             // Positions quantized as uint16 unorm relative to node bounds (0=min, 65535=max).
             // Octant is not stored here — it's derived at load time from the octant metadata structure.
-            // Color alpha is dropped: point size is driven by _LodSizeScale from the subsampling ratio.
+            // Color alpha is dropped: point size is driven by _ScreenExtent from the subsampling ratio.
             var bMin = nodeBounds.min;
             var bSize = nodeBounds.size;
             float invX = bSize.x > 0 ? 65535f / bSize.x : 0f;

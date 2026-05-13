@@ -30,19 +30,39 @@ namespace StoryLabResearch.PointCloud
         [SerializeField] private bool UseSceneCameraInEditMode = true;
 
         [Tooltip("Reduces LOD detail towards the screen periphery, concentrating the point budget near the gaze point. " +
-                 "0 = disabled. 1 = moderate. Higher values = more aggressive peripheral culling.")]
+                 "0 = disabled. Higher values = more aggressive peripheral culling.")]
         [SerializeField] private float FoveationStrength = 0f;
 
-        [Tooltip("Nodes closer than this distance (world units) are never penalised by foveation, regardless of screen position.")]
-        [SerializeField] private float FoveationNearDistance = 5f;
+        [Tooltip("Normalised viewport radius inside which foveation has no effect (full fidelity zone). " +
+                 "0 = no inner window, penalty starts at centre. 0.5 = half the screen width. Default 0.1.")]
+        [Range(0f, 0.5f)]
+        [SerializeField] private float FoveationInnerRadius = 0.1f;
 
-        private static readonly int PropLodSizeScale   = Shader.PropertyToID("_LodSizeScale");
+        [Tooltip("Normalised viewport radius at which the full FoveationStrength penalty is reached. " +
+                 "Must be >= FoveationInnerRadius. 0.5 = screen edge. Default 0.5.")]
+        [Range(0f, 0.5f)]
+        [SerializeField] private float FoveationOuterRadius = 0.5f;
+
+
         private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
+        private static readonly int PropScreenExtent     = Shader.PropertyToID("_ScreenExtent");
+        private static readonly int PropPointSize        = Shader.PropertyToID("_PointSize");
 
-        private readonly List<NodeDrawable> _activeDrawables = new();
+        private readonly List<NodeDrawable> _activeDrawables  = new();
         private readonly List<NodeDrawable> _pendingDrawables = new();
-        private readonly List<QueueEntry> _queue = new();
+
+        // Min-heap ordered by ascending ScreenError (we pop the max, so we invert on insert).
+        // We use a flat List<QueueEntry> as a max-heap (largest ScreenError = highest priority).
+        private readonly List<QueueEntry> _heap = new();
+
         private readonly Dictionary<OctreeNode, float> _selectedNodes = new();
+
+        // Reused per-frame allocations.
+        private readonly Plane[] _frustumPlanes = new Plane[6];
+
+        // NodeDrawable pool to avoid per-frame GC alloc.
+        private readonly List<NodeDrawable> _drawablePool = new();
+        private int _poolCursor;
 
         private void OnEnable()
         {
@@ -77,6 +97,7 @@ namespace StoryLabResearch.PointCloud
             if (cam == null) return;
 
             _pendingDrawables.Clear();
+            _poolCursor = 0;
             SelectNodes(cam);
 
             DeregisterAll();
@@ -103,27 +124,28 @@ namespace StoryLabResearch.PointCloud
         {
             var localToWorld = transform.localToWorldMatrix;
             float halfFovTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
-            var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(cam);
+            GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
-            // Priority queue: enqueue nodes sorted by screen error (largest first).
+            // Precompute screen extent factor: abs(P._11_22) * _PointSize * 0.5
+            // lodScale is per-node and multiplied in below, so fold everything else
+            // into a base extent and scale it per node before passing as _ScreenExtent.
+            var proj = cam.projectionMatrix;
+            float pointSize = _material.GetFloat(PropPointSize) * PointSizeScale * 0.5f;
+            var screenExtentBase = new Vector2(
+                Mathf.Abs(proj.m00) * pointSize,
+                Mathf.Abs(proj.m11) * pointSize);
+
+            // Max-heap: enqueue nodes sorted by screen error (largest first).
             // Pop nodes one at a time; if within budget and above error threshold, expand children.
             // Otherwise, mark node as selected (frontier).
-            _queue.Clear();
+            _heap.Clear();
             _selectedNodes.Clear();
-            Enqueue(_asset.Root, null, cam, halfFovTan, frustumPlanes, localToWorld);
+            HeapPush(_asset.Root, null, cam, halfFovTan, localToWorld);
 
             int remaining = PointBudget;
-            int queueHead = 0;
-            while (queueHead < _queue.Count)
+            while (_heap.Count > 0)
             {
-                // Find the highest-error entry from queueHead onward (linear scan, no alloc).
-                int bestIdx = queueHead;
-                for (int j = queueHead + 1; j < _queue.Count; j++)
-                    if (_queue[j].ScreenError > _queue[bestIdx].ScreenError) bestIdx = j;
-
-                var entry = _queue[bestIdx];
-                _queue[bestIdx] = _queue[queueHead];
-                queueHead++;
+                var entry = HeapPop();
 
                 var node = entry.Node;
                 if (!node.IsLoaded)
@@ -134,26 +156,9 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                float effectiveThreshold = ScreenErrorThreshold;
-                if (FoveationStrength > 0f)
-                {
-                    float nodeDist = Vector3.Distance(cam.transform.position, entry.WorldCenter);
-                    float distBlend = Mathf.Clamp01((nodeDist - FoveationNearDistance) / FoveationNearDistance);
-                    if (distBlend > 0f)
-                    {
-                        var vp = cam.WorldToViewportPoint(entry.WorldCenter);
-                        // vp.z < 0 means the point is behind the camera — treat as on-axis so no penalty.
-                        if (vp.z > 0f)
-                        {
-                            float dx = Mathf.Clamp(vp.x, 0f, 1f) - 0.5f;
-                            float dy = Mathf.Clamp(vp.y, 0f, 1f) - 0.5f;
-                            float r2 = dx * dx + dy * dy;
-                            float thresholdScale = 1f + FoveationStrength * r2 * 4f;
-                            effectiveThreshold *= Mathf.Lerp(1f, thresholdScale, distBlend);
-                        }
-                    }
-                }
-                bool tooSmall = entry.ScreenError < effectiveThreshold;
+                // HeapError = ScreenError / foveationScale, so comparing against the base threshold
+                // is equivalent to comparing ScreenError against threshold * foveationScale.
+                bool tooSmall    = entry.HeapError < ScreenErrorThreshold;
                 bool outOfBudget = remaining <= 0;
 
                 if (tooSmall || outOfBudget || node.IsLeaf)
@@ -166,7 +171,7 @@ namespace StoryLabResearch.PointCloud
                     for (int o = 0; o < 8; o++)
                     {
                         if (node.Children[o] != null)
-                            Enqueue(node.Children[o], node, cam, halfFovTan, frustumPlanes, localToWorld);
+                            HeapPush(node.Children[o], node, cam, halfFovTan, localToWorld);
                     }
                 }
             }
@@ -175,7 +180,7 @@ namespace StoryLabResearch.PointCloud
             float minDrawError = ScreenErrorThreshold * MinDrawErrorFraction;
             foreach (var kvp in _selectedNodes)
             {
-                var node = kvp.Key;
+                var node       = kvp.Key;
                 float screenError = kvp.Value;
 
                 if (node.TotalPointCount == 0) continue;
@@ -185,8 +190,8 @@ namespace StoryLabResearch.PointCloud
 
                 // Build active octant bitmask: skip octants whose child is also selected.
                 int activeMask = 0;
-                int totalKept = 0;
-                int totalOrig = 0;
+                int totalKept  = 0;
+                int totalOrig  = 0;
                 for (int o = 0; o < 8; o++)
                 {
                     if (node.OctantPointCounts[o] == 0) continue;
@@ -196,39 +201,131 @@ namespace StoryLabResearch.PointCloud
                     if (!childSelected)
                     {
                         activeMask |= (1 << o);
-                        totalKept += node.OctantPointCounts[o];
-                        totalOrig += node.OctantOriginalCounts[o];
+                        totalKept  += node.OctantPointCounts[o];
+                        totalOrig  += node.OctantOriginalCounts[o];
                     }
                 }
 
                 if (activeMask == 0) continue;
 
                 // sqrt(ratio) converts point-count ratio to linear size ratio (area ∝ size²).
-                float ratio = totalOrig > 0 ? (float)totalOrig / totalKept : 1f;
-                float lodScale = Mathf.Sqrt(ratio) * PointSizeScale;
+                float ratio    = totalOrig > 0 ? (float)totalOrig / totalKept : 1f;
+                float lodScale = Mathf.Sqrt(ratio);
 
-                _pendingDrawables.Add(new NodeDrawable(node, _material, localToWorld, lodScale, activeMask));
+                // Scale the precomputed base extent by this node's lodScale.
+                var screenExtent = screenExtentBase * lodScale;
+
+                _pendingDrawables.Add(GetDrawable(node, _material, localToWorld, activeMask, totalKept, screenExtent));
             }
         }
 
-        private void Enqueue(OctreeNode node, OctreeNode parent, Camera cam, float halfFovTan,
-            Plane[] frustumPlanes, Matrix4x4 localToWorld)
+        // ----- Foveation scale -----
+
+        // Returns the foveation threshold multiplier (>= 1) for a node given its viewport-space
+        // centre and its raw screen error (used to shrink the projected centre toward screen centre).
+        private float FoveationScale(Vector3 worldCenter, float rawError, Camera cam, float halfFovTan)
+        {
+            if (FoveationStrength <= 0f) return 1f;
+            var vp = cam.WorldToViewportPoint(worldCenter);
+            if (vp.z <= 0f) return 1f; // behind camera — no penalty
+
+            float screenHalfH = rawError * halfFovTan * 0.5f / cam.aspect;
+            float screenHalfV = rawError * halfFovTan * 0.5f;
+            float dx = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.x, 0f, 1f) - 0.5f) - screenHalfH);
+            float dy = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.y, 0f, 1f) - 0.5f) - screenHalfV) * cam.aspect;
+            float r  = Mathf.Max(dx, dy);
+            float outer = Mathf.Max(FoveationOuterRadius, FoveationInnerRadius + 0.001f);
+            float t = Mathf.Clamp01((r - FoveationInnerRadius) / (outer - FoveationInnerRadius));
+            t = t * t * (3f - 2f * t); // smoothstep
+            return 1f + FoveationStrength * t;
+        }
+
+        // ----- Heap push/pop (max-heap on foveation-adjusted ScreenError) -----
+
+        private void HeapPush(OctreeNode node, OctreeNode parent, Camera cam, float halfFovTan, Matrix4x4 localToWorld)
         {
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
-            if (!GeometryUtility.TestPlanesAABB(frustumPlanes, worldBounds)) return;
+            if (!GeometryUtility.TestPlanesAABB(_frustumPlanes, worldBounds)) return;
 
-            float dist = Vector3.Distance(cam.transform.position, worldBounds.center);
+            // Distance to nearest point on the AABB, so nodes the camera is inside or
+            // behind don't get an inflated screen error and consume the entire point budget.
+            var camPos = cam.transform.position;
+            var closest = new Vector3(
+                Mathf.Clamp(camPos.x, worldBounds.min.x, worldBounds.max.x),
+                Mathf.Clamp(camPos.y, worldBounds.min.y, worldBounds.max.y),
+                Mathf.Clamp(camPos.z, worldBounds.min.z, worldBounds.max.z));
+            float dist     = Vector3.Distance(camPos, closest);
             float rawError = dist > 0.001f
                 ? worldBounds.extents.magnitude / dist / halfFovTan
                 : float.MaxValue;
 
-            _queue.Add(new QueueEntry(node, parent, worldBounds.center, rawError));
+            // Divide raw error by foveation scale so peripheral nodes sort lower in the heap
+            // and get expanded after central nodes. This ensures budget runs out in the right order.
+            float fovScale   = FoveationScale(worldBounds.center, rawError, cam, halfFovTan);
+            float heapError  = rawError / fovScale;
+
+            var entry = new QueueEntry(node, parent, worldBounds.center, rawError, heapError);
+            _heap.Add(entry);
+            // Sift up on HeapError.
+            int i = _heap.Count - 1;
+            while (i > 0)
+            {
+                int parent_ = (i - 1) >> 1;
+                if (_heap[parent_].HeapError >= _heap[i].HeapError) break;
+                (_heap[i], _heap[parent_]) = (_heap[parent_], _heap[i]);
+                i = parent_;
+            }
         }
+
+        private QueueEntry HeapPop()
+        {
+            var top = _heap[0];
+            int last = _heap.Count - 1;
+            _heap[0] = _heap[last];
+            _heap.RemoveAt(last);
+            // Sift down on HeapError.
+            int i = 0;
+            int count = _heap.Count;
+            while (true)
+            {
+                int l = (i << 1) + 1;
+                int r = l + 1;
+                int largest = i;
+                if (l < count && _heap[l].HeapError > _heap[largest].HeapError) largest = l;
+                if (r < count && _heap[r].HeapError > _heap[largest].HeapError) largest = r;
+                if (largest == i) break;
+                (_heap[i], _heap[largest]) = (_heap[largest], _heap[i]);
+                i = largest;
+            }
+            return top;
+        }
+
+        // ----- NodeDrawable pool -----
+
+        private NodeDrawable GetDrawable(OctreeNode node, Material material,
+            Matrix4x4 localToWorld, int activeMask, int vertCount, Vector2 screenExtent)
+        {
+            NodeDrawable d;
+            if (_poolCursor < _drawablePool.Count)
+            {
+                d = _drawablePool[_poolCursor++];
+            }
+            else
+            {
+                d = new NodeDrawable();
+                _drawablePool.Add(d);
+                _poolCursor++;
+            }
+            d.Set(node, material, localToWorld, activeMask, vertCount, screenExtent);
+            return d;
+        }
+
+        // ----- Utilities -----
 
         private static Bounds TransformBounds(Bounds localBounds, Matrix4x4 m)
         {
-            var center = m.MultiplyPoint3x4(localBounds.center);
+            var center  = m.MultiplyPoint3x4(localBounds.center);
             var extents = localBounds.extents;
             var newExtents = new Vector3(
                 Mathf.Abs(m.m00) * extents.x + Mathf.Abs(m.m01) * extents.y + Mathf.Abs(m.m02) * extents.z,
@@ -244,43 +341,49 @@ namespace StoryLabResearch.PointCloud
             _activeDrawables.Clear();
         }
 
+        // ----- Inner types -----
+
         private readonly struct QueueEntry
         {
             public readonly OctreeNode Node;
             public readonly OctreeNode Parent;   // fallback if Node isn't loaded yet
-            public readonly Vector3 WorldCenter; // world-space bounds centre, for foveation projection
-            public readonly float ScreenError;
-            public QueueEntry(OctreeNode node, OctreeNode parent, Vector3 worldCenter, float screenError)
+            public readonly Vector3 WorldCenter; // world-space bounds centre
+            public readonly float ScreenError;   // raw geometric error, used for LOD size scale
+            public readonly float HeapError;     // ScreenError / foveationScale, used for heap ordering and stop test
+            public QueueEntry(OctreeNode node, OctreeNode parent, Vector3 worldCenter, float screenError, float heapError)
             {
-                Node = node; Parent = parent; WorldCenter = worldCenter; ScreenError = screenError;
+                Node = node; Parent = parent; WorldCenter = worldCenter; ScreenError = screenError; HeapError = heapError;
             }
         }
 
+        // Mutable class so it can be pooled and reused across frames.
         private sealed class NodeDrawable : IPointCloudDrawable
         {
-            private readonly OctreeNode _node;
-            private readonly Material _material;
-            private readonly Matrix4x4 _localToWorld;
-            private readonly float _lodSizeScale;
-            private readonly int _activeMask;
+            private OctreeNode _node;
+            private Material   _material;
+            private Matrix4x4  _localToWorld;
+            private int        _activeMask;
+            private int        _vertCount;    // totalKept * 4 (Quads)
+            private Vector2    _screenExtent; // precomputed: abs(P._11_22) * _PointSize * lodScale * 0.5
 
-            public NodeDrawable(OctreeNode node, Material material,
-                Matrix4x4 localToWorld, float lodSizeScale, int activeMask)
+            public void Set(OctreeNode node, Material material,
+                Matrix4x4 localToWorld, int activeMask, int vertCount, Vector2 screenExtent)
             {
-                _node = node;
-                _material = material;
+                _node         = node;
+                _material     = material;
                 _localToWorld = localToWorld;
-                _lodSizeScale = lodSizeScale;
-                _activeMask = activeMask;
+                _activeMask   = activeMask;
+                _vertCount    = vertCount * 4;
+                _screenExtent = screenExtent;
             }
 
             public void Draw(RasterCommandBuffer cmd)
             {
                 var block = _node.PropertyBlock;
-                block.SetFloat(PropLodSizeScale, _lodSizeScale);
                 block.SetInt(PropActiveOctantMask, _activeMask);
+                block.SetVector(PropScreenExtent,  new Vector4(_screenExtent.x, _screenExtent.y, 0, 0));
                 cmd.DrawProcedural(_localToWorld, _material, 0,
-                    MeshTopology.Triangles, _node.TotalPointCount * 6, 1, block);
+                    MeshTopology.Quads, _vertCount, 1, block);
             }
         }
     }

@@ -43,7 +43,6 @@ Shader "StoryLab PointCloud/URP Octree"
 
             CBUFFER_START(UnityPerMaterial)
                 float _PointSize;
-                float _LodSizeScale;
                 half4 _Color;
                 float _ColorBlend;
             CBUFFER_END
@@ -56,11 +55,11 @@ Shader "StoryLab PointCloud/URP Octree"
             StructuredBuffer<uint3> _Points;
             float3 _BoundsMin;
             float3 _BoundsSize;
-            int _ActiveOctantMask; // bitmask: bit o set = draw octant o
+            int   _ActiveOctantMask; // bitmask: bit o set = draw octant o
+            float2 _ScreenExtent;    // precomputed on CPU: abs(P._11_22) * _PointSize * lodScale * 0.5
 
-            // Square quad: two triangles covering [-1,1]^2 UV space
-            static const float2 _CornerUV[4]  = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
-            static const uint   _CornerMap[6]  = { 0, 1, 2, 0, 2, 3 };
+            // Quad: 4 verts in order TL, BL, BR, TR — matches MeshTopology.Quads winding.
+            static const float2 _CornerUV[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
 
             struct a2v
             {
@@ -94,7 +93,7 @@ Shader "StoryLab PointCloud/URP Octree"
                 ZERO_INITIALIZE(v2f, o);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
 
-                uint pointIdx = input.vertexID / 6;
+                uint pointIdx = input.vertexID / 4;
 
                 // Single fetch: position + color + octant in one uint3 (12 bytes, one cache line).
                 uint3 pt = _Points[pointIdx];
@@ -104,8 +103,7 @@ Shader "StoryLab PointCloud/URP Octree"
                 if ((_ActiveOctantMask & (1u << octant)) == 0u)
                     return o; // SV_POSITION = (0,0,0,0) → degenerate, clipped for free
 
-                uint corner = _CornerMap[input.vertexID % 6];
-                float2 uv   = _CornerUV[corner];
+                float2 uv = _CornerUV[input.vertexID % 4];
 
                 // Dequantize position from uint16 unorm to world space.
                 float3 pos = _BoundsMin + _BoundsSize * float3(
@@ -113,7 +111,7 @@ Shader "StoryLab PointCloud/URP Octree"
                     (pt.x >> 16)     * (1.0 / 65535.0),
                     (pt.z & 0xFFFFu) * (1.0 / 65535.0));
 
-                // Unpack RGB from bits 0-23 of pt.y (alpha is gone — size driven by _LodSizeScale).
+                // Unpack RGB from bits 0-23 of pt.y (alpha is gone — size driven by _ScreenExtent).
                 half3 color = half3(
                      pt.y        & 0xFFu,
                     (pt.y >>  8) & 0xFFu,
@@ -122,9 +120,8 @@ Shader "StoryLab PointCloud/URP Octree"
 
                 float4 clipPos = TransformWorldToHClip(mul(UNITY_MATRIX_M, float4(pos, 1.0)).xyz);
 
-                float radius = _PointSize * _LodSizeScale * 0.5;
-                float2 extent = abs(UNITY_MATRIX_P._11_22 * radius);
-                clipPos.xy += uv * extent;
+                // _ScreenExtent is precomputed on CPU: abs(P._11_22) * _PointSize * lodScale * 0.5
+                clipPos.xy += uv * _ScreenExtent;
 
                 o.clipPos = clipPos;
                 o.color   = color; // half3 RGB, no alpha
