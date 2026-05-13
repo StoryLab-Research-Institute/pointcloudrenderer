@@ -110,9 +110,8 @@ namespace StoryLabResearch.PointCloud
 
             int nodeIndex = metaList.Count;
             metaList.Add(default);
-            // Reserve 8 chunk slots for this node (pos+col per octant = 16 entries,
-            // but we store them interleaved: pos0,col0,pos1,col1,...).
-            // We push 16 nulls then fill them in below.
+            // Reserve 16 chunk slots (2 per octant: pointBytes + null colour placeholder).
+            // Colour is fused into word1 of the point data, so the second slot is always null.
             int chunkBase = binChunks.Count;
             for (int o = 0; o < 8; o++) { binChunks.Add(null); binChunks.Add(null); }
 
@@ -139,13 +138,13 @@ namespace StoryLabResearch.PointCloud
                 {
                     if (octantLists[o].Count == 0) continue;
                     WritePointData(positions, colors, octantLists[o].ToArray(), 0, octantLists[o].Count,
-                        out var posBytes, out var colBytes);
+                        bounds, out var pointBytes);
                     octantPtCounts[o] = octantLists[o].Count;
-                    octantOrigCounts[o] = octantLists[o].Count; // no subsampling at leaves
-                    octantPosLengths[o] = posBytes.Length;
-                    octantColLengths[o] = colBytes.Length;
-                    binChunks[chunkBase + o * 2]     = posBytes;
-                    binChunks[chunkBase + o * 2 + 1] = colBytes;
+                    octantOrigCounts[o] = octantLists[o].Count;
+                    octantPosLengths[o] = pointBytes.Length;
+                    octantColLengths[o] = 0;
+                    binChunks[chunkBase + o * 2]     = pointBytes;
+                    binChunks[chunkBase + o * 2 + 1] = null;
                 }
 
                 metaList[nodeIndex] = new OctreeAsset.PublicNodeMetadata
@@ -182,13 +181,13 @@ namespace StoryLabResearch.PointCloud
                 var kept = GridSubsample(positions, octArr, 0, octArr.Length, octBounds, gridRes, TargetPointsPerOctant);
 
                 WritePointData(positions, colors, kept, 0, kept.Length,
-                    out var posBytes, out var colBytes);
+                    bounds, out var pointBytes);
                 octantPtCounts[o] = kept.Length;
-                octantOrigCounts[o] = octArr.Length; // full count before subsampling
-                octantPosLengths[o] = posBytes.Length;
-                octantColLengths[o] = colBytes.Length;
-                binChunks[chunkBase + o * 2]     = posBytes;
-                binChunks[chunkBase + o * 2 + 1] = colBytes;
+                octantOrigCounts[o] = octArr.Length;
+                octantPosLengths[o] = pointBytes.Length;
+                octantColLengths[o] = 0;
+                binChunks[chunkBase + o * 2]     = pointBytes;
+                binChunks[chunkBase + o * 2 + 1] = null;
 
                 // Remaining points recurse into a child node.
                 var keptSet = new HashSet<int>(kept);
@@ -274,18 +273,50 @@ namespace StoryLabResearch.PointCloud
         }
 
         private static void WritePointData(Vector3[] positions, uint[] colors, int[] indices,
-            int start, int count, out byte[] posBytes, out byte[] colBytes)
+            int start, int count, Bounds nodeBounds, out byte[] pointBytes)
         {
-            posBytes = new byte[count * 12];
-            colBytes = new byte[count * 4];
+            // Pack each point as uint3 (12 bytes):
+            //   .x = (uint16_y << 16) | uint16_x  — X and Y quantized to node bounds
+            //   .y = (octant << 24) | RGB24        — octant in top byte (derived at load), RGB in low 3
+            //   .z = uint16_z in low 16 bits       — Z quantized to node bounds, upper 16 spare
+            // Positions quantized as uint16 unorm relative to node bounds (0=min, 65535=max).
+            // Octant is not stored here — it's derived at load time from the octant metadata structure.
+            // Color alpha is dropped: point size is driven by _LodSizeScale from the subsampling ratio.
+            var bMin = nodeBounds.min;
+            var bSize = nodeBounds.size;
+            float invX = bSize.x > 0 ? 65535f / bSize.x : 0f;
+            float invY = bSize.y > 0 ? 65535f / bSize.y : 0f;
+            float invZ = bSize.z > 0 ? 65535f / bSize.z : 0f;
+
+            pointBytes = new byte[count * 12];
             for (int i = 0; i < count; i++)
             {
                 int idx = indices[start + i];
-                var p = positions[idx];
-                Buffer.BlockCopy(BitConverter.GetBytes(p.x), 0, posBytes, i * 12 + 0, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes(p.y), 0, posBytes, i * 12 + 4, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes(p.z), 0, posBytes, i * 12 + 8, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes(colors[idx]), 0, colBytes, i * 4, 4);
+                var p = positions[idx] - bMin;
+                uint qx = (uint)Mathf.Clamp(Mathf.RoundToInt(p.x * invX), 0, 65535);
+                uint qy = (uint)Mathf.Clamp(Mathf.RoundToInt(p.y * invY), 0, 65535);
+                uint qz = (uint)Mathf.Clamp(Mathf.RoundToInt(p.z * invZ), 0, 65535);
+
+                uint col = colors[idx];
+                uint rgb = col & 0x00FFFFFFu; // strip alpha entirely
+
+                uint word0 = (qy << 16) | qx;
+                uint word1 = rgb;             // octant written at load time into top byte
+                uint word2 = qz;              // upper 16 bits spare
+
+                int b = i * 12;
+                pointBytes[b + 0]  = (byte)(word0);
+                pointBytes[b + 1]  = (byte)(word0 >> 8);
+                pointBytes[b + 2]  = (byte)(word0 >> 16);
+                pointBytes[b + 3]  = (byte)(word0 >> 24);
+                pointBytes[b + 4]  = (byte)(word1);
+                pointBytes[b + 5]  = (byte)(word1 >> 8);
+                pointBytes[b + 6]  = (byte)(word1 >> 16);
+                pointBytes[b + 7]  = (byte)(word1 >> 24);
+                pointBytes[b + 8]  = (byte)(word2);
+                pointBytes[b + 9]  = (byte)(word2 >> 8);
+                pointBytes[b + 10] = (byte)(word2 >> 16);
+                pointBytes[b + 11] = (byte)(word2 >> 24);
             }
         }
     }

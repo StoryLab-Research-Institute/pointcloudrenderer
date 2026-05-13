@@ -41,11 +41,7 @@ namespace StoryLabResearch.PointCloud
                 renderPassEvent = RenderPassEvent.AfterRenderingOpaques;
             }
 
-            public static void Register(IPointCloudDrawable drawable)
-            {
-                if (!_drawables.Contains(drawable))
-                    _drawables.Add(drawable);
-            }
+            public static void Register(IPointCloudDrawable drawable) => _drawables.Add(drawable);
 
             public static void Deregister(IPointCloudDrawable drawable)
             {
@@ -56,14 +52,19 @@ namespace StoryLabResearch.PointCloud
             {
                 if (_drawables.Count == 0) return;
 
-                using var builder = renderGraph.AddUnsafePass<PassData>("PointCloud", out var passData);
+                var resourceData = frameData.Get<UniversalResourceData>();
+
+                using var builder = renderGraph.AddRasterRenderPass<PassData>("PointCloud", out var passData);
                 passData.Drawables = _drawables;
 
-                // No declared resource handles — we draw into whatever the current render target is.
+                // Declare colour and depth attachments so URP can schedule depth priming correctly.
+                builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.Write);
+                builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture, AccessFlags.ReadWrite);
+
                 builder.AllowPassCulling(false);
-                builder.SetRenderFunc(static (PassData data, UnsafeGraphContext context) =>
+                builder.SetRenderFunc(static (PassData data, RasterGraphContext context) =>
                 {
-                    var cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
+                    var cmd = context.cmd;
                     foreach (var drawable in data.Drawables)
                         drawable.Draw(cmd);
                 });

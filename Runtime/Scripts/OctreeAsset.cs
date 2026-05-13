@@ -26,7 +26,6 @@ namespace StoryLabResearch.PointCloud
         private bool _loaded;
 
         public OctreeNode Root => (_nodes != null && _nodes.Length > 0) ? _nodes[0] : null;
-        public int MaxNodeDepth { get; private set; }
 
         public void Load()
         {
@@ -80,9 +79,11 @@ namespace StoryLabResearch.PointCloud
             }
 
             // Third pass: build merged GPU buffers.
-            // Binary layout: for each node, for each octant 0-7: posBytes then colBytes.
-            // All octants are merged into one buffer per node; a per-point octant index buffer
-            // lets the shader mask out octants covered by selected children (bitmask).
+            // Binary layout: for each node, for each octant 0-7: uint3 per point (12 bytes).
+            //   word0 = (uint16_y << 16) | uint16_x  — XY quantized relative to node bounds
+            //   word1 = RGB24 in bits 0-23            — octant (0-7) injected into bits 24-26 at load time
+            //   word2 = uint16_z in bits 0-15         — Z quantized, upper 16 bits spare
+            // colLen is always 0 in this format; colour is fused into word1.
             int fileOffset = 0;
             for (int i = 0; i < count; i++)
             {
@@ -91,16 +92,14 @@ namespace StoryLabResearch.PointCloud
 
                 node.OctantPointCounts = new int[8];
                 node.OctantOriginalCounts = new int[8];
-                node.OctantStarts = new int[8];
 
                 int total = 0;
                 for (int o = 0; o < 8; o++)
                 {
-                    node.OctantStarts[o] = total;
                     node.OctantPointCounts[o] = meta.OctantPointCounts[o];
                     node.OctantOriginalCounts[o] = meta.OctantOriginalCounts != null
                         ? meta.OctantOriginalCounts[o]
-                        : meta.OctantPointCounts[o]; // fallback for assets built before this change
+                        : meta.OctantPointCounts[o];
                     total += meta.OctantPointCounts[o];
                 }
                 node.TotalPointCount = total;
@@ -112,56 +111,47 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                // Compute per-octant file offsets, then merge into flat CPU arrays.
+                // Compute per-octant file offsets (OctantColLengths are 0 in the new format).
                 var octantFileOffsets = new int[8];
                 octantFileOffsets[0] = fileOffset;
                 for (int o = 1; o < 8; o++)
                     octantFileOffsets[o] = octantFileOffsets[o - 1]
                         + meta.OctantPosLengths[o - 1] + meta.OctantColLengths[o - 1];
 
-                var mergedPos = new byte[total * 12];
-                var mergedCol = new byte[total * 4];
-                var octantIndices = new uint[total];
-
+                // Merge octants into one buffer, injecting octant index into word1 bits 24-26.
+                var packed = new uint[total * 3];
                 int writeIdx = 0;
                 for (int o = 0; o < 8; o++)
                 {
-                    int pts = meta.OctantPointCounts[o];
+                    int pts    = meta.OctantPointCounts[o];
                     int posLen = meta.OctantPosLengths[o];
-                    int colLen = meta.OctantColLengths[o];
 
                     if (pts > 0 && posLen > 0)
                     {
-                        Buffer.BlockCopy(fileBytes, octantFileOffsets[o],
-                            mergedPos, writeIdx * 12, posLen);
-                        Buffer.BlockCopy(fileBytes, octantFileOffsets[o] + posLen,
-                            mergedCol, writeIdx * 4, colLen);
+                        int base_ = octantFileOffsets[o];
+                        uint octantBits = (uint)o << 24;
                         for (int p = 0; p < pts; p++)
-                            octantIndices[writeIdx + p] = (uint)o;
-                        writeIdx += pts;
+                        {
+                            int b = base_ + p * 12;
+                            packed[writeIdx * 3 + 0] = BitConverter.ToUInt32(fileBytes, b + 0);
+                            packed[writeIdx * 3 + 1] = BitConverter.ToUInt32(fileBytes, b + 4) | octantBits;
+                            packed[writeIdx * 3 + 2] = BitConverter.ToUInt32(fileBytes, b + 8);
+                            writeIdx++;
+                        }
                     }
 
-                    fileOffset += posLen + colLen;
+                    fileOffset += meta.OctantPosLengths[o] + meta.OctantColLengths[o];
                 }
 
-                node.MergedPositionBuffer = new ComputeBuffer(total, 12);
-                node.MergedPositionBuffer.SetData(mergedPos);
+                node.PointBuffer = new ComputeBuffer(total, 12);
+                node.PointBuffer.SetData(packed);
 
-                node.MergedColorBuffer = new ComputeBuffer(total, 4);
-                node.MergedColorBuffer.SetData(mergedCol);
-
-                node.OctantIndexBuffer = new ComputeBuffer(total, 4);
-                node.OctantIndexBuffer.SetData(octantIndices);
-
+                var bn = meta.Bounds;
                 node.PropertyBlock = new MaterialPropertyBlock();
-                node.PropertyBlock.SetBuffer("_Positions", node.MergedPositionBuffer);
-                node.PropertyBlock.SetBuffer("_ColorsPacked", node.MergedColorBuffer);
-                node.PropertyBlock.SetBuffer("_OctantIndices", node.OctantIndexBuffer);
+                node.PropertyBlock.SetBuffer("_Points", node.PointBuffer);
+                node.PropertyBlock.SetVector("_BoundsMin",  new Vector4(bn.min.x,  bn.min.y,  bn.min.z,  0));
+                node.PropertyBlock.SetVector("_BoundsSize", new Vector4(bn.size.x, bn.size.y, bn.size.z, 0));
             }
-
-            MaxNodeDepth = 0;
-            foreach (var node in _nodes)
-                if (node.Depth > MaxNodeDepth) MaxNodeDepth = node.Depth;
 
             _loaded = true;
         }
@@ -173,11 +163,6 @@ namespace StoryLabResearch.PointCloud
                 node.ReleaseBuffers();
             _nodes = null;
             _loaded = false;
-        }
-
-        public void PrepareView(Vector3 position, Quaternion orientation, float fovDegrees)
-        {
-            Load();
         }
 
         [Serializable]

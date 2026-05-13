@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -13,7 +14,14 @@ namespace StoryLabResearch.PointCloud
         [SerializeField] private OctreeAsset _asset;
         [SerializeField] private Material _material;
         [SerializeField] private int PointBudget = 2_000_000;
-        [SerializeField] private float ScreenErrorThreshold = 0.01f;
+
+        [Tooltip("Stop refining a node when its angular size (extents / distance / tan(halfFov)) drops below this. " +
+                 "Higher values cull distant nodes more aggressively. Try 0.1–0.5. Default 0.2.")]
+        [SerializeField] private float ScreenErrorThreshold = 0.2f;
+
+        [Tooltip("Skip drawing nodes whose screen error is below this fraction of ScreenErrorThreshold. " +
+                 "Culls sub-pixel nodes that contribute overdraw with no visual benefit. 0 = disabled.")]
+        [SerializeField] private float MinDrawErrorFraction = 0.1f;
 
         [Tooltip("Global point size multiplier. Tune visually — the per-node scale is derived from the subsampling ratio, so this just sets the overall base size.")]
         [SerializeField] private float PointSizeScale = 1.0f;
@@ -21,12 +29,20 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("In edit mode, follow the scene view camera instead of Camera.main.")]
         [SerializeField] private bool UseSceneCameraInEditMode = true;
 
+        [Tooltip("Reduces LOD detail towards the screen periphery, concentrating the point budget near the gaze point. " +
+                 "0 = disabled. 1 = moderate. Higher values = more aggressive peripheral culling.")]
+        [SerializeField] private float FoveationStrength = 0f;
+
+        [Tooltip("Nodes closer than this distance (world units) are never penalised by foveation, regardless of screen position.")]
+        [SerializeField] private float FoveationNearDistance = 5f;
+
+        private static readonly int PropLodSizeScale   = Shader.PropertyToID("_LodSizeScale");
+        private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
+
         private readonly List<NodeDrawable> _activeDrawables = new();
         private readonly List<NodeDrawable> _pendingDrawables = new();
         private readonly List<QueueEntry> _queue = new();
-        private readonly HashSet<OctreeNode> _selectedNodes = new();
-
-        private void OnEnable() { }
+        private readonly Dictionary<OctreeNode, float> _selectedNodes = new();
 
         private void OnDisable()
         {
@@ -65,16 +81,9 @@ namespace StoryLabResearch.PointCloud
             return Camera.main;
         }
 
-        public void PrepareView(Vector3 worldPosition, Quaternion orientation)
-        {
-            var cam = ResolveCamera();
-            _asset.PrepareView(worldPosition, orientation, cam != null ? cam.fieldOfView : 60f);
-        }
-
         private void SelectNodes(Camera cam)
         {
             var localToWorld = transform.localToWorldMatrix;
-            var camPos = cam.transform.position;
             float halfFovTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             var frustumPlanes = GeometryUtility.CalculateFrustumPlanes(cam);
 
@@ -83,43 +92,80 @@ namespace StoryLabResearch.PointCloud
             // Otherwise, mark node as selected (frontier).
             _queue.Clear();
             _selectedNodes.Clear();
-            Enqueue(_asset.Root, camPos, halfFovTan, frustumPlanes, localToWorld);
+            Enqueue(_asset.Root, null, cam, halfFovTan, frustumPlanes, localToWorld);
 
             int remaining = PointBudget;
-            while (_queue.Count > 0)
+            int queueHead = 0;
+            while (queueHead < _queue.Count)
             {
-                var entry = DequeueMax();
-                var node = entry.Node;
-                if (!node.IsLoaded) continue;
+                // Find the highest-error entry from queueHead onward (linear scan, no alloc).
+                int bestIdx = queueHead;
+                for (int j = queueHead + 1; j < _queue.Count; j++)
+                    if (_queue[j].ScreenError > _queue[bestIdx].ScreenError) bestIdx = j;
 
-                bool tooSmall = entry.ScreenError < ScreenErrorThreshold;
+                var entry = _queue[bestIdx];
+                _queue[bestIdx] = _queue[queueHead];
+                queueHead++;
+
+                var node = entry.Node;
+                if (!node.IsLoaded)
+                {
+                    // Fall back to the nearest loaded ancestor so there's no visible hole.
+                    if (entry.Parent != null && entry.Parent.IsLoaded)
+                        _selectedNodes[entry.Parent] = entry.ScreenError;
+                    continue;
+                }
+
+                float effectiveThreshold = ScreenErrorThreshold;
+                if (FoveationStrength > 0f)
+                {
+                    float nodeDist = Vector3.Distance(cam.transform.position, entry.WorldCenter);
+                    float distBlend = Mathf.Clamp01((nodeDist - FoveationNearDistance) / FoveationNearDistance);
+                    if (distBlend > 0f)
+                    {
+                        var vp = cam.WorldToViewportPoint(entry.WorldCenter);
+                        // vp.z < 0 means the point is behind the camera — treat as on-axis so no penalty.
+                        if (vp.z > 0f)
+                        {
+                            float dx = Mathf.Clamp(vp.x, 0f, 1f) - 0.5f;
+                            float dy = Mathf.Clamp(vp.y, 0f, 1f) - 0.5f;
+                            float r2 = dx * dx + dy * dy;
+                            float thresholdScale = 1f + FoveationStrength * r2 * 4f;
+                            effectiveThreshold *= Mathf.Lerp(1f, thresholdScale, distBlend);
+                        }
+                    }
+                }
+                bool tooSmall = entry.ScreenError < effectiveThreshold;
                 bool outOfBudget = remaining <= 0;
 
                 if (tooSmall || outOfBudget || node.IsLeaf)
                 {
-                    _selectedNodes.Add(node);
+                    _selectedNodes[node] = entry.ScreenError;
                     remaining -= node.TotalPointCount;
                 }
                 else
                 {
-                    // Expand: charge this node's own points (level sample), recurse into children.
-                    remaining -= node.TotalPointCount;
                     for (int o = 0; o < 8; o++)
                     {
                         if (node.Children[o] != null)
-                            Enqueue(node.Children[o], camPos, halfFovTan, frustumPlanes, localToWorld);
+                            Enqueue(node.Children[o], node, cam, halfFovTan, frustumPlanes, localToWorld);
                     }
                 }
             }
 
             // Emit one draw call per selected node.
-            // lodScale is derived from the subsampling ratio: sqrt(originalCount / keptCount).
-            // This gives each node's points enough screen area to cover what the original density would.
-            foreach (var node in _selectedNodes)
+            float minDrawError = ScreenErrorThreshold * MinDrawErrorFraction;
+            foreach (var kvp in _selectedNodes)
             {
+                var node = kvp.Key;
+                float screenError = kvp.Value;
+
                 if (node.TotalPointCount == 0) continue;
 
-                // Build active octant bitmask and accumulate subsampling ratio across active octants.
+                // Skip nodes too small to contribute visibly — reduces overdraw from tiny distant nodes.
+                if (MinDrawErrorFraction > 0 && screenError < minDrawError) continue;
+
+                // Build active octant bitmask: skip octants whose child is also selected.
                 int activeMask = 0;
                 int totalKept = 0;
                 int totalOrig = 0;
@@ -128,7 +174,7 @@ namespace StoryLabResearch.PointCloud
                     if (node.OctantPointCounts[o] == 0) continue;
                     bool childSelected = !node.IsLeaf
                         && node.Children[o] != null
-                        && _selectedNodes.Contains(node.Children[o]);
+                        && _selectedNodes.ContainsKey(node.Children[o]);
                     if (!childSelected)
                     {
                         activeMask |= (1 << o);
@@ -147,30 +193,19 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private QueueEntry DequeueMax()
-        {
-            // Queue is kept sorted descending by ScreenError, so index 0 is largest.
-            var entry = _queue[0];
-            _queue.RemoveAt(0);
-            return entry;
-        }
-
-        private void Enqueue(OctreeNode node, Vector3 camPos, float halfFovTan,
+        private void Enqueue(OctreeNode node, OctreeNode parent, Camera cam, float halfFovTan,
             Plane[] frustumPlanes, Matrix4x4 localToWorld)
         {
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
             if (!GeometryUtility.TestPlanesAABB(frustumPlanes, worldBounds)) return;
 
-            float dist = Vector3.Distance(camPos, worldBounds.center);
-            float error = dist > 0.001f
+            float dist = Vector3.Distance(cam.transform.position, worldBounds.center);
+            float rawError = dist > 0.001f
                 ? worldBounds.extents.magnitude / dist / halfFovTan
                 : float.MaxValue;
 
-            // Insert sorted descending.
-            int i = 0;
-            while (i < _queue.Count && _queue[i].ScreenError > error) i++;
-            _queue.Insert(i, new QueueEntry(node, error));
+            _queue.Add(new QueueEntry(node, parent, worldBounds.center, rawError));
         }
 
         private static Bounds TransformBounds(Bounds localBounds, Matrix4x4 m)
@@ -194,8 +229,13 @@ namespace StoryLabResearch.PointCloud
         private readonly struct QueueEntry
         {
             public readonly OctreeNode Node;
+            public readonly OctreeNode Parent;   // fallback if Node isn't loaded yet
+            public readonly Vector3 WorldCenter; // world-space bounds centre, for foveation projection
             public readonly float ScreenError;
-            public QueueEntry(OctreeNode node, float screenError) { Node = node; ScreenError = screenError; }
+            public QueueEntry(OctreeNode node, OctreeNode parent, Vector3 worldCenter, float screenError)
+            {
+                Node = node; Parent = parent; WorldCenter = worldCenter; ScreenError = screenError;
+            }
         }
 
         private sealed class NodeDrawable : IPointCloudDrawable
@@ -216,13 +256,11 @@ namespace StoryLabResearch.PointCloud
                 _activeMask = activeMask;
             }
 
-            public Bounds WorldBounds => _node.Bounds;
-
-            public void Draw(CommandBuffer cmd)
+            public void Draw(RasterCommandBuffer cmd)
             {
                 var block = _node.PropertyBlock;
-                block.SetFloat("_LodSizeScale", _lodSizeScale);
-                block.SetInt("_ActiveOctantMask", _activeMask);
+                block.SetFloat(PropLodSizeScale, _lodSizeScale);
+                block.SetInt(PropActiveOctantMask, _activeMask);
                 cmd.DrawProcedural(_localToWorld, _material, 0,
                     MeshTopology.Triangles, _node.TotalPointCount * 6, 1, block);
             }

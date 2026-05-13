@@ -1,11 +1,10 @@
-using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 
 namespace StoryLabResearch.PointCloud
 {
     public interface IPointCloudDrawable
     {
-        Bounds WorldBounds { get; }
-        void Draw(CommandBuffer cmd);
+        void Draw(RasterCommandBuffer cmd);
     }
 }

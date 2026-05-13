@@ -1,6 +1,6 @@
-using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.RenderGraphModule;
 
 namespace StoryLabResearch.PointCloud
 {
@@ -13,14 +13,9 @@ namespace StoryLabResearch.PointCloud
         [SerializeField] private Material _material;
         [SerializeField] private MeshFilter _source;
 
-        private ComputeBuffer _positionBuffer;
-        private ComputeBuffer _colorBuffer;
+        private ComputeBuffer _pointBuffer;
         private MaterialPropertyBlock _propertyBlock;
         private int _pointCount;
-
-        // Positions are baked into the buffer in world space at OnEnable time.
-        // Moving this GameObject after enable will not update the rendered positions.
-        public Bounds WorldBounds { get; private set; }
 
         private void OnEnable()
         {
@@ -32,43 +27,46 @@ namespace StoryLabResearch.PointCloud
 
             var localVertices = mesh.vertices;
             _pointCount = localVertices.Length;
-
-            // Transform positions to world space and write as tightly-packed float3.
-            var positions = new Point3[_pointCount];
             var matrix = transform.localToWorldMatrix;
-            for (int i = 0; i < _pointCount; i++)
-            {
-                var wp = matrix.MultiplyPoint3x4(localVertices[i]);
-                positions[i] = new Point3(wp.x, wp.y, wp.z);
-            }
 
             var colors32 = mesh.colors32;
-            var packedColors = new uint[_pointCount];
-            if (colors32 != null && colors32.Length == _pointCount)
+            bool hasColors = colors32 != null && colors32.Length == _pointCount;
+
+            // Compute world-space bounds for quantization.
+            var worldBounds = new Bounds(matrix.MultiplyPoint3x4(localVertices[0]), Vector3.zero);
+            for (int i = 1; i < _pointCount; i++)
+                worldBounds.Encapsulate(matrix.MultiplyPoint3x4(localVertices[i]));
+            var bMin  = worldBounds.min;
+            var bSize = worldBounds.size;
+            float invX = bSize.x > 0 ? 65535f / bSize.x : 0f;
+            float invY = bSize.y > 0 ? 65535f / bSize.y : 0f;
+            float invZ = bSize.z > 0 ? 65535f / bSize.z : 0f;
+
+            // Pack into uint3 (12 bytes): same format as OctreeAsset.
+            // All points use octant 0; _ActiveOctantMask = 0xFF enables all octants.
+            var packed = new uint[_pointCount * 3];
+            for (int i = 0; i < _pointCount; i++)
             {
-                for (int i = 0; i < _pointCount; i++)
-                {
-                    var c = colors32[i];
-                    packedColors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16) | ((uint)c.a << 24);
-                }
-            }
-            else
-            {
-                for (int i = 0; i < _pointCount; i++)
-                    packedColors[i] = 0xFFFFFFFF;
+                var wp = matrix.MultiplyPoint3x4(localVertices[i]) - bMin;
+                uint qx = (uint)Mathf.Clamp(Mathf.RoundToInt(wp.x * invX), 0, 65535);
+                uint qy = (uint)Mathf.Clamp(Mathf.RoundToInt(wp.y * invY), 0, 65535);
+                uint qz = (uint)Mathf.Clamp(Mathf.RoundToInt(wp.z * invZ), 0, 65535);
+                uint rgb = hasColors
+                    ? (uint)colors32[i].r | ((uint)colors32[i].g << 8) | ((uint)colors32[i].b << 16)
+                    : 0x00FFFFFFu;
+                packed[i * 3 + 0] = (qy << 16) | qx;
+                packed[i * 3 + 1] = rgb; // octant bits 24-26 = 0 (octant 0)
+                packed[i * 3 + 2] = qz;
             }
 
-            _positionBuffer = new ComputeBuffer(_pointCount, 12);
-            _positionBuffer.SetData(positions);
-
-            _colorBuffer = new ComputeBuffer(_pointCount, 4);
-            _colorBuffer.SetData(packedColors);
+            _pointBuffer = new ComputeBuffer(_pointCount, 12);
+            _pointBuffer.SetData(packed);
 
             _propertyBlock = new MaterialPropertyBlock();
-            _propertyBlock.SetBuffer("_Positions", _positionBuffer);
-            _propertyBlock.SetBuffer("_ColorsPacked", _colorBuffer);
-
-            WorldBounds = TransformBounds(mesh.bounds, matrix);
+            _propertyBlock.SetBuffer("_Points", _pointBuffer);
+            _propertyBlock.SetVector("_BoundsMin",  new Vector4(bMin.x,  bMin.y,  bMin.z,  0));
+            _propertyBlock.SetVector("_BoundsSize", new Vector4(bSize.x, bSize.y, bSize.z, 0));
+            _propertyBlock.SetInt("_ActiveOctantMask", 0xFF);
 
             PointCloudRenderFeature.PointCloudRenderPass.Register(this);
         }
@@ -76,43 +74,14 @@ namespace StoryLabResearch.PointCloud
         private void OnDisable()
         {
             PointCloudRenderFeature.PointCloudRenderPass.Deregister(this);
-
-            _positionBuffer?.Release();
-            _positionBuffer = null;
-
-            _colorBuffer?.Release();
-            _colorBuffer = null;
+            _pointBuffer?.Release();
+            _pointBuffer = null;
         }
 
-        public void Draw(CommandBuffer cmd)
+        public void Draw(RasterCommandBuffer cmd)
         {
             cmd.DrawProcedural(Matrix4x4.identity, _material, 0,
                 MeshTopology.Triangles, _pointCount * 6, 1, _propertyBlock);
-        }
-
-        private static Bounds TransformBounds(Bounds localBounds, Matrix4x4 matrix)
-        {
-            var center = matrix.MultiplyPoint3x4(localBounds.center);
-            var extents = localBounds.extents;
-            // Transform all 8 corners and compute enclosing world-space bounds.
-            var worldBounds = new Bounds(center, Vector3.zero);
-            for (int i = 0; i < 8; i++)
-            {
-                var corner = center + matrix.MultiplyVector(new Vector3(
-                    ((i & 1) == 0 ? -1f : 1f) * extents.x,
-                    ((i & 2) == 0 ? -1f : 1f) * extents.y,
-                    ((i & 4) == 0 ? -1f : 1f) * extents.z));
-                worldBounds.Encapsulate(corner);
-            }
-            return worldBounds;
-        }
-
-        // Tightly-packed float3 matching the shader's StructuredBuffer<float3> stride of 12 bytes.
-        [StructLayout(LayoutKind.Sequential)]
-        private struct Point3
-        {
-            public float x, y, z;
-            public Point3(float x, float y, float z) { this.x = x; this.y = y; this.z = z; }
         }
     }
 }

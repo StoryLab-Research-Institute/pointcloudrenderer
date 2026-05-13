@@ -8,33 +8,27 @@ namespace StoryLabResearch.PointCloud
         public int Depth;
         public OctreeNode[] Children; // [8], null entry = no child for that octant
 
-        // Merged buffers: all octants concatenated in order 0-7.
-        // OctantIndexBuffer stores a per-point uint octant index for shader masking.
-        public ComputeBuffer MergedPositionBuffer;  // stride 12, float3 per point
-        public ComputeBuffer MergedColorBuffer;     // stride 4,  uint RGBA8 per point
-        public ComputeBuffer OctantIndexBuffer;     // stride 4,  uint octant index per point
+        // Single interleaved buffer: uint3 per point (12 bytes).
+        //   word0 = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
+        //   word1 = (octant << 24) | RGB24        — octant in bits 24-26, colour in bits 0-23
+        //   word2 = uint16_z in bits 0-15
+        public ComputeBuffer PointBuffer; // stride 12, uint3 per point
         public MaterialPropertyBlock PropertyBlock;
         public int TotalPointCount;
 
         public int[] OctantPointCounts;    // [8] — kept points per octant
         public int[] OctantOriginalCounts; // [8] — pre-subsampling count (equals OctantPointCounts for leaves)
-        public int[] OctantStarts;         // [8] — start index in merged buffer per octant
 
-        public bool IsLoaded => MergedPositionBuffer != null;
+        public bool IsLoaded => PointBuffer != null;
         public bool IsLeaf => Children == null;
 
         public void ReleaseBuffers()
         {
-            MergedPositionBuffer?.Release();
-            MergedColorBuffer?.Release();
-            OctantIndexBuffer?.Release();
-            MergedPositionBuffer = null;
-            MergedColorBuffer = null;
-            OctantIndexBuffer = null;
+            PointBuffer?.Release();
+            PointBuffer = null;
             PropertyBlock = null;
             OctantPointCounts = null;
             OctantOriginalCounts = null;
-            OctantStarts = null;
             TotalPointCount = 0;
         }
     }
