@@ -143,9 +143,9 @@ namespace StoryLabResearch.PointCloud
 
         private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
         private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
-        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 2f;
+        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 8f;
         private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.1f;
-        private float P_FoveationOuterRadius => ActiveProperties?.FoveationOuterRadius    ?? 0.5f;
+        private float P_FoveationOuterRadius => ActiveProperties?.FoveationOuterRadius    ?? 0.4f;
 
 
         private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
@@ -362,11 +362,9 @@ namespace StoryLabResearch.PointCloud
             var   localToWorld  = transform.localToWorldMatrix;
             float halfFovTan    = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             var   camPos        = cam.transform.position;
-            float camAspect     = cam.aspect;
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
-            // Cache foveation properties — these resolve ActiveProperties on every access
-            // and are called O(nodes) times per frame inside FoveationThresholdMultiplier.
+            // Cache properties — each P_ accessor resolves ActiveProperties via a property chain.
             bool  fovEnabled     = P_FoveationEnabled;
             float fovStrength    = P_FoveationStrength;
             float fovInner       = P_FoveationInnerRadius;
@@ -374,10 +372,6 @@ namespace StoryLabResearch.PointCloud
             float errorThreshold = P_ScreenErrorThreshold;
             float minDrawFrac    = P_MinDrawErrorFraction;
             bool  occlusionCull  = P_OcclusionCulling;
-
-            // Precompute log(fovStrength+1) so FoveationThresholdMultiplier can use
-            // Exp(t * logBase) instead of Pow(base, t) — avoids a log per node.
-            float fovLogBase = fovEnabled && fovStrength > 0f ? Mathf.Log(fovStrength + 1f) : 0f;
 
             // Cache the VP matrix for manual WorldToViewport transform — avoids a Unity
             // interop call (cam.WorldToViewportPoint) on every node in the foveation path.
@@ -409,13 +403,19 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                // Per-node threshold: foveal nodes use the base threshold (expand as far as error
-                // allows), peripheral nodes use a raised threshold (stop expanding sooner).
-                // Budget freed by early peripheral stopping is naturally available for foveal expansion.
-                // WorldBounds is cached in the entry from HeapPush — no recomputation needed.
-                float fovMult    = FoveationThresholdMultiplier(entry.WorldBounds.center, entry.ScreenError,
-                                       vpMatrix, camAspect, halfFovTan, fovEnabled, fovLogBase, fovInner, fovOuter);
-                bool tooSmall    = entry.ScreenError < errorThreshold * fovMult;
+                // Foveation: raise the error threshold for peripheral nodes.
+                // t=0 (fovea) → multiplier=1 (no change). t=1 (periphery) → multiplier=fovStrength.
+                // Large nearby nodes have error >> threshold even after scaling, so they expand
+                // naturally. Distant or peripheral nodes hit the raised threshold sooner and stop,
+                // freeing budget for foveal nodes to expand deeper.
+                float effectiveThreshold = errorThreshold;
+                if (fovEnabled)
+                {
+                    float t = FoveationT(vpMatrix, fovInner, fovOuter, entry.WorldBounds, camPos);
+                    effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
+                }
+
+                bool tooSmall    = entry.ScreenError < effectiveThreshold;
                 bool outOfBudget = remaining <= 0;
 
                 if (tooSmall || outOfBudget || node.IsLeaf)
@@ -473,39 +473,30 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        // ----- Foveation threshold multiplier -----
+        // ----- Foveation helpers -----
 
-        // Returns a value >= 1 representing how much to raise the stopping threshold for this node.
-        // t=0 (fovea): multiplier=1 — threshold unchanged, node expands as far as error allows.
-        // t=1 (periphery): multiplier=(FoveationStrength+1) — threshold raised, expansion stops sooner.
-        // Applied to the per-node stopping test in SelectNodes, not to heap ordering, so the error
-        // metric governs selection order purely on geometric grounds. Budget redistributes naturally:
-        // peripheral nodes stop earlier, freeing budget for foveal nodes to expand deeper.
-        private float FoveationThresholdMultiplier(Vector3 worldCenter, float rawError,
-            Matrix4x4 vpMatrix, float camAspect, float halfFovTan,
-            bool fovEnabled, float fovLogBase, float fovInner, float fovOuter)
+        // Returns t in [0,1]: 0 = fully inside foveal zone (no cap), 1 = fully peripheral (full cap).
+        // Uses Chebyshev distance in viewport space — naturally rectangular, wider than tall in pixels.
+        private float FoveationT(Matrix4x4 vpMatrix,
+            float fovInner, float fovOuter, Bounds worldBounds, Vector3 camPos)
         {
-            if (!fovEnabled || fovLogBase <= 0f) return 1f;
+            // Project the node centre. If the camera is inside the bounds, the centre
+            // may be behind or very close — use the closest surface point instead so
+            // we still get a valid screen-space direction.
+            Vector3 samplePoint = worldBounds.Contains(camPos)
+                ? worldBounds.ClosestPoint(camPos + (worldBounds.center - camPos).normalized * 0.001f)
+                : worldBounds.center;
 
-            // Manual clip-space transform — avoids Unity interop overhead of cam.WorldToViewportPoint.
-            var clip = vpMatrix.MultiplyPoint(worldCenter);
-            if (clip.z <= 0f) return 1f; // behind camera — no penalty
-            float vpx = clip.x * 0.5f + 0.5f;
-            float vpy = clip.y * 0.5f + 0.5f;
-
-            float screenHalfH = rawError * halfFovTan * 0.5f / camAspect;
-            float screenHalfV = rawError * halfFovTan * 0.5f;
-            // dx and dy both in raw viewport space (x: 0-1 = screen width, y: 0-1 = screen height).
-            // Mathf.Max gives Chebyshev distance — fovea zone is a square in viewport space,
-            // which is naturally wider than tall in pixels for landscape aspect ratios.
-            float dx = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x) - screenHalfH);
-            float dy = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y) - screenHalfV);
-            float r  = Mathf.Max(dx, dy);
+            var h = vpMatrix * new Vector4(samplePoint.x, samplePoint.y, samplePoint.z, 1f);
+            if (h.w <= 0f) return 1f;
+            float invW = 1f / h.w;
+            float vpx  = h.x * invW * 0.5f + 0.5f;
+            float vpy  = h.y * invW * 0.5f + 0.5f;
+            float dx   = Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x);
+            float dy   = Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y);
+            float r    = Mathf.Max(dx, dy);
             float outer = Mathf.Max(fovOuter, fovInner + 0.001f);
-            float t = Mathf.Clamp01((r - fovInner) / (outer - fovInner));
-            t = t * t * (3f - 2f * t); // smoothstep
-            // Exp(t * log(base)) is equivalent to Pow(base, t) but avoids recomputing log each call.
-            return Mathf.Exp(t * fovLogBase);
+            return Mathf.Clamp01((r - fovInner) / (outer - fovInner));
         }
 
         // ----- Heap push/pop (max-heap on raw ScreenError) -----
