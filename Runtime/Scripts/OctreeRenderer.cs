@@ -415,22 +415,24 @@ namespace StoryLabResearch.PointCloud
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
-                bool tooSmall    = entry.ScreenError < effectiveThreshold;
-                bool outOfBudget = remaining <= 0;
+                bool tooSmall = entry.ScreenError < effectiveThreshold;
 
-                if (tooSmall || outOfBudget || node.IsLeaf)
-                {
-                    _selectedNodes[node] = entry.ScreenError;
-                    remaining -= node.TotalPointCount;
-                }
-                else
+                if (!tooSmall && !node.IsLeaf && remaining > 0)
                 {
                     for (int o = 0; o < 8; o++)
                     {
                         if (node.Children[o] != null)
                             HeapPush(node.Children[o], node, camPos, halfFovTan, localToWorld, occlusionCull);
                     }
+                    continue;
                 }
+
+                // Select this node. If it exceeds the remaining budget we select it anyway
+                // to avoid holes — a small overshoot on the last node is preferable to
+                // silently dropping visible geometry. The heap is ordered by screen error
+                // so the most visible nodes are always selected first.
+                _selectedNodes[node] = entry.ScreenError;
+                remaining -= node.TotalPointCount;
             }
 
             // Emit one draw call per selected node.

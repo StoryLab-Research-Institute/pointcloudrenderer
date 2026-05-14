@@ -7,7 +7,9 @@ namespace StoryLabResearch.PointCloud
         menuName = "Point Cloud/Render Properties")]
     public class PointCloudRenderProperties : ScriptableObject
     {
-        [Tooltip("Maximum number of points drawn per frame across all LOD levels.")]
+        [Tooltip("Controls LOD traversal depth. Higher values expand the octree further before stopping, " +
+                 "increasing detail and triangle count. Actual triangles rendered will exceed this value — " +
+                 "tune alongside ScreenErrorThreshold to hit your target frame budget on target hardware.")]
         public int PointBudget = 2_000_000;
 
         [Tooltip("Stop refining a node when its angular size drops below this. " +
@@ -35,14 +37,14 @@ namespace StoryLabResearch.PointCloud
         [Range(1f, 32f)]
         public float FoveationStrength = 8f;
 
-        [Tooltip("Normalised viewport radius inside which foveation has no effect (full depth allowed). " +
-                 "0 = cap starts at centre. 0.5 = half the screen width.")]
-        [Range(0f, 0.5f)]
+        [Tooltip("Viewport radius inside which foveation has no effect. " +
+                 "0 = effect starts at centre. 0.1 = small protected zone around gaze point.")]
+        [Range(0f, 1f)]
         public float FoveationInnerRadius = 0.1f;
 
-        [Tooltip("Normalised viewport radius at which the full FoveationDepthCap is applied. " +
-                 "Between inner and outer the cap interpolates linearly. 0.5 = screen edge.")]
-        [Range(0f, 0.5f)]
-        public float FoveationOuterRadius = 0.4f;
+        [Tooltip("Viewport radius at which full FoveationStrength is applied. " +
+                 "Set to 1.0 to cover the full screen even when gaze is at a corner.")]
+        [Range(0f, 1f)]
+        public float FoveationOuterRadius = 0.6f;
     }
 }
