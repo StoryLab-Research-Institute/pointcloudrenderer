@@ -31,20 +31,17 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Concentrate the point budget near the screen centre, reducing detail in peripheral vision.")]
         public bool FoveationEnabled = false;
 
-        [Tooltip("How much to raise the LOD stopping threshold for fully peripheral nodes. " +
-                 "A multiplier on ScreenErrorThreshold: 1 = no effect, 10 = peripheral nodes stop " +
-                 "expanding 10x sooner. Budget freed flows naturally to foveal nodes. Try 4–16.")]
-        [Range(1f, 32f)]
-        public float FoveationStrength = 8f;
+        [Tooltip("How much to raise the LOD stopping threshold for peripheral nodes. " +
+                 "A multiplier on ScreenErrorThreshold applied to nodes outside the inner radius. " +
+                 "Higher values = more aggressive peripheral reduction. Try 16–64.")]
+        [Range(1f, 64f)]
+        public float FoveationStrength = 32f;
 
-        [Tooltip("Viewport radius inside which foveation has no effect. " +
-                 "0 = effect starts at centre. 0.1 = small protected zone around gaze point.")]
+        [Tooltip("Viewport radius inside which foveation has no effect (full quality). " +
+                 "Nodes whose projected extent overlaps this zone are never penalised. " +
+                 "0 = effect starts at centre. 0.2 = reasonable protected zone.")]
         [Range(0f, 1f)]
-        public float FoveationInnerRadius = 0.1f;
+        public float FoveationInnerRadius = 0.2f;
 
-        [Tooltip("Viewport radius at which full FoveationStrength is applied. " +
-                 "Set to 1.0 to cover the full screen even when gaze is at a corner.")]
-        [Range(0f, 1f)]
-        public float FoveationOuterRadius = 0.6f;
     }
 }

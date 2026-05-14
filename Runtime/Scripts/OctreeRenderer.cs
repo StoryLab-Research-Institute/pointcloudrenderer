@@ -141,11 +141,14 @@ namespace StoryLabResearch.PointCloud
         // Assign from an external gaze controller to drive foveated LOD from gaze input.
         [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
 
+        // Diagnostics — updated each frame, readable from editor scripts or on-screen debug UI.
+        [NonSerialized] public int LastFramePointsDrawn;
+        [NonSerialized] public int LastFramePointsFoveationSaved;
+
         private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
         private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
-        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 8f;
-        private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.1f;
-        private float P_FoveationOuterRadius => ActiveProperties?.FoveationOuterRadius    ?? 0.4f;
+        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 32f;
+        private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.2f;
 
 
         private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
@@ -365,10 +368,9 @@ namespace StoryLabResearch.PointCloud
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
             // Cache properties — each P_ accessor resolves ActiveProperties via a property chain.
-            bool  fovEnabled     = P_FoveationEnabled;
-            float fovStrength    = P_FoveationStrength;
-            float fovInner       = P_FoveationInnerRadius;
-            float fovOuter       = P_FoveationOuterRadius;
+            bool  fovEnabled  = P_FoveationEnabled;
+            float fovStrength = P_FoveationStrength;
+            float fovInner    = P_FoveationInnerRadius;
             float errorThreshold = P_ScreenErrorThreshold;
             float minDrawFrac    = P_MinDrawErrorFraction;
             bool  occlusionCull  = P_OcclusionCulling;
@@ -389,7 +391,8 @@ namespace StoryLabResearch.PointCloud
             _selectedNodes.Clear();
             HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull);
 
-            int remaining = P_PointBudget;
+            int remaining       = P_PointBudget;
+            int foveationSaved  = 0;
             while (_heap.Count > 0)
             {
                 var entry = HeapPop();
@@ -409,12 +412,14 @@ namespace StoryLabResearch.PointCloud
                 // naturally. Distant or peripheral nodes hit the raised threshold sooner and stop,
                 // freeing budget for foveal nodes to expand deeper.
                 float effectiveThreshold = errorThreshold;
+                bool  hardCapped         = false;
                 if (fovEnabled)
                 {
-                    float t = FoveationT(vpMatrix, fovInner, fovOuter, entry.WorldBounds, camPos);
+                    float t = FoveationT(vpMatrix, fovInner, entry.WorldBounds, camPos, entry.ScreenError, halfFovTan);
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
+                bool wouldExpandWithoutFov = entry.ScreenError >= errorThreshold && !node.IsLeaf && remaining > 0;
                 bool tooSmall = entry.ScreenError < effectiveThreshold;
 
                 if (!tooSmall && !node.IsLeaf && remaining > 0)
@@ -433,9 +438,15 @@ namespace StoryLabResearch.PointCloud
                 // so the most visible nodes are always selected first.
                 _selectedNodes[node] = entry.ScreenError;
                 remaining -= node.TotalPointCount;
+
+                // If foveation stopped expansion that would otherwise have continued,
+                // count this node's points as saved by foveation.
+                if (fovEnabled && wouldExpandWithoutFov && tooSmall)
+                    foveationSaved += node.TotalPointCount;
             }
 
             // Emit one draw call per selected node.
+            LastFramePointsDrawn = 0;
             float minDrawError = errorThreshold * minDrawFrac;
             foreach (var kvp in _selectedNodes)
             {
@@ -472,33 +483,39 @@ namespace StoryLabResearch.PointCloud
                 float lodScale = Mathf.Sqrt(ratio) * pointSizeBase;
 
                 _pendingDrawables.Add(GetDrawable(node, mat, localToWorld, activeMask, totalKept, lodScale));
+                LastFramePointsDrawn += totalKept;
             }
+
+            LastFramePointsFoveationSaved = foveationSaved;
         }
 
         // ----- Foveation helpers -----
 
         // Returns t in [0,1]: 0 = fully inside foveal zone (no cap), 1 = fully peripheral (full cap).
         // Uses Chebyshev distance in viewport space — naturally rectangular, wider than tall in pixels.
-        private float FoveationT(Matrix4x4 vpMatrix,
-            float fovInner, float fovOuter, Bounds worldBounds, Vector3 camPos)
+        // Returns 0 if the node is foveal (no penalty), 1 if peripheral (full strength applied).
+        // Uses a hard step at fovInner — inside is always protected, outside always penalised.
+        // Node screen-space radius is subtracted from the distance so nodes whose extent
+        // overlaps the inner zone are protected even if their centre is outside it.
+        // The subtraction is clamped to fovInner minimum so peripheral large nodes are
+        // still penalised — the radius can only pull r down to the inner boundary.
+        private float FoveationT(Matrix4x4 vpMatrix, float fovInner,
+            Bounds worldBounds, Vector3 camPos, float screenError, float halfFovTan)
         {
-            // Project the node centre. If the camera is inside the bounds, the centre
-            // may be behind or very close — use the closest surface point instead so
-            // we still get a valid screen-space direction.
-            Vector3 samplePoint = worldBounds.Contains(camPos)
-                ? worldBounds.ClosestPoint(camPos + (worldBounds.center - camPos).normalized * 0.001f)
-                : worldBounds.center;
-
-            var h = vpMatrix * new Vector4(samplePoint.x, samplePoint.y, samplePoint.z, 1f);
-            if (h.w <= 0f) return 1f;
+            var c = worldBounds.center;
+            var h = vpMatrix * new Vector4(c.x, c.y, c.z, 1f);
+            if (h.w <= 0f) return 0f; // centre behind camera — straddles camera, never penalise
             float invW = 1f / h.w;
             float vpx  = h.x * invW * 0.5f + 0.5f;
             float vpy  = h.y * invW * 0.5f + 0.5f;
-            float dx   = Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x);
-            float dy   = Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y);
-            float r    = Mathf.Max(dx, dy);
-            float outer = Mathf.Max(fovOuter, fovInner + 0.001f);
-            return Mathf.Clamp01((r - fovInner) / (outer - fovInner));
+            float dx         = Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x);
+            float dy         = Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y);
+            float r          = Mathf.Max(dx, dy);
+            float nodeRadius = screenError * halfFovTan * 0.5f;
+            // Peripheral if even accounting for the node's projected extent it doesn't
+            // reach the inner zone. Large boundary nodes with big nodeRadius but centres
+            // far from the fovea still get t=1 because r >> nodeRadius + fovInner.
+            return (r - nodeRadius) > fovInner ? 1f : 0f;
         }
 
         // ----- Heap push/pop (max-heap on raw ScreenError) -----
@@ -651,16 +668,11 @@ namespace StoryLabResearch.PointCloud
             var cam = Camera.current;
             if (cam == null) return;
 
-            float inner = P_FoveationInnerRadius;
-            float outer = P_FoveationOuterRadius;
+            float   inner  = P_FoveationInnerRadius;
             Vector2 centre = FoveationCentre;
-            float depth = (cam.nearClipPlane + cam.farClipPlane) * 0.5f;
+            float   depth  = (cam.nearClipPlane + cam.farClipPlane) * 0.5f;
 
-            Color solid = GizmoColor;
-            Color dim   = new Color(solid.r * 0.5f, solid.g * 0.5f, solid.b * 0.5f, 1f);
-
-            DrawFoveaRect(cam, centre, inner, solid, depth);
-            DrawFoveaRect(cam, centre, outer, dim,   depth);
+            DrawFoveaRect(cam, centre, inner, GizmoColor, depth);
         }
 
         private static void DrawFoveaRect(Camera cam, Vector2 vp, float r, Color color, float depth)
