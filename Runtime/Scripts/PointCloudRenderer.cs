@@ -511,7 +511,7 @@ namespace StoryLabResearch.PointCloud
                 float sqEffectiveThreshold = sqErrorThreshold;
                 if (fovEnabled)
                 {
-                    float t = FoveationT(vpMatrix, fovInner, entry.WorldCenter, entry.ScreenError, halfFovTan);
+                    float t = FoveationT(vpMatrix, fovInner, entry.WorldCenter, entry.WorldExtentX, entry.WorldExtentY, entry.WorldExtentZ);
                     // t in [0,1]; lerp(1, fovStrength, t) = 1 + (fovStrength-1)*t
                     float mul = 1f + (fovStrength - 1f) * t;
                     sqEffectiveThreshold *= mul * mul; // square the linear multiplier
@@ -645,36 +645,48 @@ namespace StoryLabResearch.PointCloud
         // ----- Foveation helpers -----
 
         // Returns t in [0,1]: 0 = inside foveal zone (no penalty), 1 = full peripheral penalty.
-        // Uses Chebyshev distance in viewport space. Nodes whose projected extent overlaps the
-        // inner zone are protected even if their centre lies outside it.
-        // t ramps linearly from 0 at the inner boundary to 1 over a zone of width fovInner.
-        // sqError is the squared screen error from HeapPush.
-        private float FoveationT(Matrix4x4 vpMatrix, float fovInner,
-            Vector3 worldCenter, float sqError, float halfFovTan)
+        // Projects the node's world-space AABB into viewport space, finds the closest point on the
+        // resulting screen-space box to the foveation centre, and uses that distance for the test.
+        // This correctly protects nodes whose bounds overlap the inner zone even if their centre
+        // lies outside it, handling elongated nodes that the old scalar nodeRadius approach missed.
+        // t ramps linearly from 0 at fovInner to 1 at 2*fovInner.
+        private float FoveationT(Matrix4x4 vp, float fovInner, Vector3 worldCenter,
+            float wex, float wey, float wez)
         {
-            var  h = vpMatrix * new Vector4(worldCenter.x, worldCenter.y, worldCenter.z, 1f);
-            if (h.w <= 0f) return 0f; // centre behind camera — never penalise
-            float invW = 1f / h.w;
-            float vpx  = h.x * invW * 0.5f + 0.5f;
-            float vpy  = h.y * invW * 0.5f + 0.5f;
-            // Inline Clamp and Abs — no Mathf call overhead.
-            float cx   = vpx < 0f ? 0f : vpx > 1f ? 1f : vpx;
-            float cy   = vpy < 0f ? 0f : vpy > 1f ? 1f : vpy;
-            float dx   = cx - FoveationCentre.x; if (dx < 0f) dx = -dx;
-            float dy   = cy - FoveationCentre.y; if (dy < 0f) dy = -dy;
-            float r    = dx > dy ? dx : dy;
-            // Early exit: centre clearly inside or outside the transition zone without nodeRadius correction.
+            // Project centre.
+            float hx = vp.m00 * worldCenter.x + vp.m01 * worldCenter.y + vp.m02 * worldCenter.z + vp.m03;
+            float hy = vp.m10 * worldCenter.x + vp.m11 * worldCenter.y + vp.m12 * worldCenter.z + vp.m13;
+            float hw = vp.m30 * worldCenter.x + vp.m31 * worldCenter.y + vp.m32 * worldCenter.z + vp.m33;
+            if (hw <= 0f) return 0f; // behind camera — never penalise
+            float invW = 1f / hw;
+            float vpx  = hx * invW * 0.5f + 0.5f;
+            float vpy  = hy * invW * 0.5f + 0.5f;
+
+            // Project world extents into screen space (NDC half-extents).
+            // Uses the upper-left 2×3 of the VP matrix, divided by W — same AABB projection
+            // as the world transform, applied to the view-projection matrix.
+            float m00 = vp.m00, m01 = vp.m01, m02 = vp.m02;
+            float m10 = vp.m10, m11 = vp.m11, m12 = vp.m12;
+            float sex = ((m00 >= 0f ? m00 : -m00) * wex + (m01 >= 0f ? m01 : -m01) * wey + (m02 >= 0f ? m02 : -m02) * wez) * invW * 0.5f;
+            float sey = ((m10 >= 0f ? m10 : -m10) * wex + (m11 >= 0f ? m11 : -m11) * wey + (m12 >= 0f ? m12 : -m12) * wez) * invW * 0.5f;
+
+            // Screen-space AABB of this node in viewport coords.
+            float sminX = vpx - sex, smaxX = vpx + sex;
+            float sminY = vpy - sey, smaxY = vpy + sey;
+
+            // Closest point on screen box to foveation centre (Chebyshev distance).
+            float fcx = FoveationCentre.x, fcy = FoveationCentre.y;
+            float closestX = fcx < sminX ? sminX : fcx > smaxX ? smaxX : fcx;
+            float closestY = fcy < sminY ? sminY : fcy > smaxY ? smaxY : fcy;
+            float dx = closestX - fcx; if (dx < 0f) dx = -dx;
+            float dy = closestY - fcy; if (dy < 0f) dy = -dy;
+            float r  = dx > dy ? dx : dy;
+
+            // Early exits before ramp math.
             if (r <= fovInner)            return 0f;
             if (r >= fovInner + fovInner) return 1f;
-            // Near the boundary — apply nodeRadius correction (one Sqrt, justified by rarity).
-            float nodeRadius = Mathf.Sqrt(sqError) * halfFovTan * 0.5f;
-            float excess = (r - nodeRadius) - fovInner;
-            if (fovInner > 0f)
-            {
-                float t = excess / fovInner;
-                return t < 0f ? 0f : t > 1f ? 1f : t;
-            }
-            return excess > 0f ? 1f : 0f;
+            float t = (r - fovInner) / fovInner;
+            return t < 0f ? 0f : t > 1f ? 1f : t;
         }
 
         // ----- Heap push/pop (max-heap on ScreenError) -----
@@ -730,7 +742,7 @@ namespace StoryLabResearch.PointCloud
                 : float.MaxValue;
 
             var worldCenter = new Vector3(wcx, wcy, wcz);
-            _heap[_heapCount] = new QueueEntry(node, parent, sqError, worldCenter);
+            _heap[_heapCount] = new QueueEntry(node, parent, sqError, worldCenter, wex, wey, wez);
             int i = _heapCount++;
             while (i > 0)
             {
@@ -806,10 +818,16 @@ namespace StoryLabResearch.PointCloud
             public readonly BVHNode Node;
             public readonly BVHNode Parent;
             public readonly float   ScreenError;
-            public readonly Vector3 WorldCenter; // precomputed world-space centre, used by foveation
-            public QueueEntry(BVHNode node, BVHNode parent, float screenError, Vector3 worldCenter)
+            public readonly Vector3 WorldCenter;  // precomputed world-space centre, used by foveation
+            public readonly float   WorldExtentX; // world-space AABB half-extents, used by foveation
+            public readonly float   WorldExtentY; // to project a screen-space box around the centre
+            public readonly float   WorldExtentZ;
+            public QueueEntry(BVHNode node, BVHNode parent, float screenError,
+                Vector3 worldCenter, float wex, float wey, float wez)
             {
-                Node = node; Parent = parent; ScreenError = screenError; WorldCenter = worldCenter;
+                Node = node; Parent = parent; ScreenError = screenError;
+                WorldCenter = worldCenter;
+                WorldExtentX = wex; WorldExtentY = wey; WorldExtentZ = wez;
             }
         }
 
