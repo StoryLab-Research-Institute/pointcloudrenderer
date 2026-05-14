@@ -13,9 +13,7 @@ namespace StoryLabResearch.PointCloud
         private const int MaxDepth = 12;
 
         // Build an OctreeAsset from raw point data without registering it with AssetDatabase —
-        // the caller
-        // (e.g. a ScriptedImporter) is responsible for embedding it as a sub-asset.
-        // binPath is a project-relative path for the companion .bin file.
+        // the caller (e.g. a ScriptedImporter) is responsible for embedding it as a sub-asset.
         public static OctreeAsset BuildFromPointsEmbedded(
             Vector3[] positions, uint[] colors,
             float minPointSpacing = 0f)
