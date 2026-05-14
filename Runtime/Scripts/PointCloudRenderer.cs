@@ -136,9 +136,8 @@ namespace StoryLabResearch.PointCloud
         // Fovea position in normalised viewport space. Defaults to screen centre.
         [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
 
-        // Diagnostics — updated each frame.
+        // Diagnostic — updated each frame.
         [NonSerialized] public int LastFramePointsDrawn;
-        [NonSerialized] public int LastFramePointsFoveationSaved;
 
         private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
         private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
@@ -162,6 +161,8 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
+        private BVHAsset _lastActiveAsset;
+
         // CullingGroup state.
         private CullingGroup     _cullingGroup;
         private BVHNode[]        _cullingNodes;
@@ -169,19 +170,19 @@ namespace StoryLabResearch.PointCloud
         private int[]            _cullingResults;
         private Camera           _cullingCamera;
         private Matrix4x4        _lastLocalToWorld;
-        private readonly HashSet<BVHNode> _occludedNodes = new HashSet<BVHNode>();
 
-        private readonly List<NodeDrawable> _activeDrawables  = new();
-        private readonly List<NodeDrawable> _pendingDrawables = new();
+        // Per-node indexed state — parallel arrays over _cullingNodes, indexed by BVHNode.IndexInRenderer.
+        private bool[]           _occludedFlags     = new bool[0];
+        private bool[]           _expandedFlags     = new bool[0];
+        private bool[]           _prevExpandedFlags = new bool[0];
+        // _selectedError[i] >= 0 means node i is selected this frame; -1f means not selected.
+        private float[]          _selectedError     = new float[0];
+        private readonly List<int> _selectedIndices = new List<int>();
 
-        private readonly List<QueueEntry> _heap = new();
+        private readonly List<NodeDrawable> _activeDrawables  = new List<NodeDrawable>();
+        private readonly List<NodeDrawable> _pendingDrawables = new List<NodeDrawable>();
 
-        private readonly Dictionary<BVHNode, float> _selectedNodes = new Dictionary<BVHNode, float>();
-        // Nodes expanded last frame (children pushed, node itself not drawn).
-        // Used for hysteresis: an expanded node stays expanded until error drops below
-        // threshold * (1 - hysteresis), preventing collapse-then-re-expand toggling.
-        private HashSet<BVHNode> _prevExpandedNodes = new HashSet<BVHNode>();
-        private HashSet<BVHNode> _expandedNodes     = new HashSet<BVHNode>();
+        private readonly List<QueueEntry> _heap = new List<QueueEntry>();
 
         private readonly Plane[] _frustumPlanes = new Plane[6];
 
@@ -201,7 +202,7 @@ namespace StoryLabResearch.PointCloud
             return true;
         }
 
-        private readonly List<NodeDrawable> _drawablePool = new();
+        private readonly List<NodeDrawable> _drawablePool = new List<NodeDrawable>();
         private int _poolCursor;
 
         private void OnEnable()
@@ -239,10 +240,19 @@ namespace StoryLabResearch.PointCloud
             var cam = ResolveCamera();
             if (cam == null) return;
 
+            if (asset != _lastActiveAsset)
+            {
+                DisposeCullingGroup();
+                _selectedIndices.Clear();
+                _lastActiveAsset = asset;
+            }
+
             if (P_OcclusionCulling)
                 RefreshCullingGroup(cam, asset);
             else
-                DisposeCullingGroup();
+            {
+                EnsureNodeIndex(asset);
+            }
 
             _pendingDrawables.Clear();
             _poolCursor = 0;
@@ -266,6 +276,36 @@ namespace StoryLabResearch.PointCloud
             }
 #endif
             return Camera.main;
+        }
+
+        // ----- Node index (always maintained, regardless of occlusion culling) -----
+
+        // Populates _cullingNodes and all parallel arrays when occlusion culling is off.
+        // When occlusion culling is on, RefreshCullingGroup handles this during its rebuild.
+        private void EnsureNodeIndex(BVHAsset asset)
+        {
+            if (_cullingNodes != null) return;
+
+            var nodes = new List<BVHNode>();
+            CollectNodes(asset.Root, nodes);
+            _cullingNodes = nodes.ToArray();
+            RebuildNodeArrays();
+        }
+
+        private void RebuildNodeArrays()
+        {
+            int n = _cullingNodes.Length;
+            for (int i = 0; i < n; i++)
+                _cullingNodes[i].IndexInRenderer = i;
+
+            _occludedFlags = new bool[n];
+            _expandedFlags = new bool[n];
+            _selectedError = new float[n];
+            Array.Fill(_selectedError, -1f);
+            // Treat all nodes as previously expanded on first frame so the LOD boundary starts
+            // conservative rather than over-expanding into nodes too small to pass minDrawError.
+            _prevExpandedFlags = new bool[n];
+            Array.Fill(_prevExpandedFlags, true);
         }
 
         // ----- Occlusion culling (CullingGroup) -----
@@ -296,6 +336,8 @@ namespace StoryLabResearch.PointCloud
                 _cullingResults   = new int[_cullingSpheres.Length];
                 _cullingCamera    = cam;
                 _lastLocalToWorld = Matrix4x4.zero;
+
+                RebuildNodeArrays();
             }
 
             if (localToWorld != _lastLocalToWorld)
@@ -311,10 +353,10 @@ namespace StoryLabResearch.PointCloud
 
             _cullingGroup.SetDistanceReferencePoint(cam.transform.position);
 
-            _occludedNodes.Clear();
+            Array.Clear(_occludedFlags, 0, _occludedFlags.Length);
             int hiddenCount = _cullingGroup.QueryIndices(false, _cullingResults, 0);
             for (int i = 0; i < hiddenCount; i++)
-                _occludedNodes.Add(_cullingNodes[_cullingResults[i]]);
+                _occludedFlags[_cullingResults[i]] = true;
         }
 
         private void DisposeCullingGroup()
@@ -322,11 +364,10 @@ namespace StoryLabResearch.PointCloud
             _cullingGroup?.Dispose();
             _cullingGroup     = null;
             _cullingCamera    = null;
-            _cullingNodes     = null;
+            _cullingNodes     = null; // null signals EnsureNodeIndex to rebuild when occlusion culling is off
             _cullingSpheres   = null;
             _cullingResults   = null;
             _lastLocalToWorld = Matrix4x4.zero;
-            _occludedNodes.Clear();
         }
 
         private static void CollectNodes(BVHNode root, List<BVHNode> result)
@@ -350,24 +391,29 @@ namespace StoryLabResearch.PointCloud
             var   camPos       = cam.transform.position;
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
-            bool  fovEnabled      = P_FoveationEnabled;
-            float fovStrength     = P_FoveationStrength;
-            float fovInner        = P_FoveationInnerRadius;
-            float errorThreshold  = P_ScreenErrorThreshold;
-            float minDrawFrac     = P_MinDrawErrorFraction;
-            bool  occlusionCull   = P_OcclusionCulling;
-            var vpMatrix = cam.projectionMatrix * cam.worldToCameraMatrix;
+            bool  fovEnabled     = P_FoveationEnabled;
+            float fovStrength    = P_FoveationStrength;
+            float fovInner       = P_FoveationInnerRadius;
+            float errorThreshold = P_ScreenErrorThreshold;
+            float minDrawFrac    = P_MinDrawErrorFraction;
+            bool  occlusionCull  = P_OcclusionCulling;
+            var   vpMatrix       = cam.projectionMatrix * cam.worldToCameraMatrix;
 
-            var   mat          = ActiveMaterial;
+            var   mat           = ActiveMaterial;
             float pointSizeBase = mat.GetFloat(PropPointSize) * P_PointSizeScale * 0.5f;
 
+            // Reset per-frame selection state — only touch indices written last frame.
+            foreach (int idx in _selectedIndices)
+                _selectedError[idx] = -1f;
+            _selectedIndices.Clear();
+
+            // _expandedFlags was swapped in from _prevExpandedFlags last frame; clear it for reuse.
+            Array.Clear(_expandedFlags, 0, _expandedFlags.Length);
+
             _heap.Clear();
-            _selectedNodes.Clear();
-            _expandedNodes.Clear();
             HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull);
 
-            int remaining      = P_PointBudget;
-            int foveationSaved = 0;
+            int remaining = P_PointBudget;
 
             while (_heap.Count > 0)
             {
@@ -376,14 +422,17 @@ namespace StoryLabResearch.PointCloud
 
                 if (!node.IsLoaded)
                 {
-                    if (entry.Parent != null && entry.Parent.IsLoaded)
-                        _selectedNodes[entry.Parent] = entry.ScreenError;
+                    var parent = entry.Parent;
+                    if (parent != null && parent.IsLoaded)
+                    {
+                        int pi = parent.IndexInRenderer;
+                        if (_selectedError[pi] < 0f)
+                            _selectedIndices.Add(pi);
+                        _selectedError[pi] = entry.ScreenError;
+                    }
                     continue;
                 }
 
-                // Foveation: raise the error threshold for peripheral nodes.
-                // t=0 (fovea) → no change. t=1 (periphery) → full fovStrength multiplier.
-                // Nodes overlapping the inner zone are never penalised.
                 float effectiveThreshold = errorThreshold;
                 if (fovEnabled)
                 {
@@ -391,10 +440,9 @@ namespace StoryLabResearch.PointCloud
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
-                // Hysteresis: a node that was expanded last frame uses a lower collapse threshold,
-                // requiring a larger drop in error before it stops expanding. This stabilises the
-                // LOD boundary — expansion is always eager, collapse requires a dead-band drop.
-                bool wasExpanded = _prevExpandedNodes.Contains(node);
+                // Hysteresis: expanded nodes use a lower collapse threshold to prevent LOD flicker.
+                int   nodeIdx     = node.IndexInRenderer;
+                bool  wasExpanded = _prevExpandedFlags[nodeIdx];
                 float activeThreshold = wasExpanded
                     ? effectiveThreshold * (1f - P_LodHysteresis)
                     : effectiveThreshold;
@@ -402,35 +450,33 @@ namespace StoryLabResearch.PointCloud
 
                 if (!tooSmall && !node.IsLeaf && remaining > 0)
                 {
-                    _expandedNodes.Add(node);
+                    _expandedFlags[nodeIdx] = true;
                     if (node.Left  != null) HeapPush(node.Left,  node, camPos, halfFovTan, localToWorld, occlusionCull);
                     if (node.Right != null) HeapPush(node.Right, node, camPos, halfFovTan, localToWorld, occlusionCull);
                     continue;
                 }
 
-                _selectedNodes[node] = entry.ScreenError;
+                if (_selectedError[nodeIdx] < 0f)
+                    _selectedIndices.Add(nodeIdx);
+                _selectedError[nodeIdx] = entry.ScreenError;
                 remaining -= node.PointCount;
-
-                if (fovEnabled && entry.ScreenError >= errorThreshold && tooSmall)
-                    foveationSaved += node.PointCount;
             }
 
             // Emit draw calls.
             LastFramePointsDrawn = 0;
-            float minDrawError   = errorThreshold * minDrawFrac;
+            float minDrawError = errorThreshold * minDrawFrac;
 
-            foreach (var kvp in _selectedNodes)
+            foreach (int idx in _selectedIndices)
             {
-                var   node        = kvp.Key;
-                float screenError = kvp.Value;
+                var   node        = _cullingNodes[idx];
+                float screenError = _selectedError[idx];
 
                 if (node.PointCount == 0) continue;
-                if (minDrawFrac > 0 && screenError < minDrawError) continue;
+                if (minDrawFrac > 0f && screenError < minDrawError) continue;
 
-                // A BVH node draws its own points unless both children are already selected —
-                // in that case the children cover the space completely and the parent is skipped.
-                bool leftSelected  = node.Left  != null && _selectedNodes.ContainsKey(node.Left);
-                bool rightSelected = node.Right != null && _selectedNodes.ContainsKey(node.Right);
+                // Skip a node if both children are already selected — children cover the space completely.
+                bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
+                bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
                 if (leftSelected && rightSelected) continue;
 
                 float ratio    = node.OriginalCount > 0 ? (float)node.OriginalCount / node.PointCount : 1f;
@@ -440,13 +486,10 @@ namespace StoryLabResearch.PointCloud
                 LastFramePointsDrawn += node.PointCount;
             }
 
-            LastFramePointsFoveationSaved = foveationSaved;
-
-            // Swap expanded-node sets: this frame's expansions become next frame's hysteresis reference.
-            var tmp = _prevExpandedNodes;
-            _prevExpandedNodes = _expandedNodes;
-            _expandedNodes = tmp;
+            // Swap expanded-flags arrays: this frame's expansions become next frame's hysteresis reference.
+            (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
         }
+
 
         // ----- Foveation helpers -----
 
@@ -478,7 +521,7 @@ namespace StoryLabResearch.PointCloud
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
             if (!TestAABBFrustum(worldBounds, _frustumPlanes)) return;
-            if (occlusionCull && _occludedNodes.Contains(node)) return;
+            if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
 
             var closest = new Vector3(
                 Mathf.Clamp(camPos.x, worldBounds.min.x, worldBounds.max.x),

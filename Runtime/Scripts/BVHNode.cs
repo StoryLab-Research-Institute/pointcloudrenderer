@@ -18,6 +18,8 @@ namespace StoryLabResearch.PointCloud
         public int PointCount;        // points stored at this node level (subsampled at internal nodes)
         public int OriginalCount;     // pre-subsampling count (equals PointCount for leaves)
 
+        public int IndexInRenderer = -1; // set by PointCloudRenderer during node-array rebuild
+
         public bool IsLoaded => PointBuffer != null;
         public bool IsLeaf   => Left == null && Right == null;
 
