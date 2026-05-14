@@ -122,6 +122,8 @@ namespace StoryLabResearch.PointCloud
                 };
 
                 node.GlobalBufferOffset = nodeOffset;
+                node.BoundsMin  = meta.Bounds.min;
+                node.BoundsSize = meta.Bounds.size;
                 node.LodScaleBase = meta.PointCount > 0 && meta.OriginalCount > meta.PointCount
                     ? Mathf.Sqrt((float)meta.OriginalCount / meta.PointCount)
                     : 1f;

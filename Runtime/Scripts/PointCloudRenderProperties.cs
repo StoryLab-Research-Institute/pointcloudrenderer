@@ -38,8 +38,9 @@ namespace StoryLabResearch.PointCloud
         public float FoveationStrength = 32f;
 
         [Tooltip("Viewport radius inside which foveation has no effect (full quality). " +
-                 "Nodes whose projected extent overlaps this zone are never penalised. " +
-                 "0 = effect starts at centre. 0.2 = reasonable protected zone.")]
+                 "Also controls the width of the transition ramp outside the boundary — " +
+                 "t ramps from 0 to 1 over a zone of this width, so larger values give a " +
+                 "softer edge that absorbs foveation-centre jitter. 0.2 = reasonable value.")]
         [Range(0f, 1f)]
         public float FoveationInnerRadius = 0.2f;
 

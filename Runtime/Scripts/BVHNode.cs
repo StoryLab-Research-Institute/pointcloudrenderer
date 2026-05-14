@@ -4,7 +4,9 @@ namespace StoryLabResearch.PointCloud
 {
     public class BVHNode
     {
-        public Bounds Bounds;
+        public Bounds  Bounds;    // kept for cold-path sphere calc in RefreshCullingGroup
+        public Vector3 BoundsMin; // plain fields — no interop cost on hot path
+        public Vector3 BoundsSize;
         public int Depth;
         public BVHNode Left;
         public BVHNode Right;

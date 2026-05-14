@@ -197,14 +197,14 @@ namespace StoryLabResearch.PointCloud
         private bool           _descriptorBufferBound;// whether _nodeDescriptorBuffer is bound to the material
         private IndirectDrawable _indirectDrawable;   // single registered drawable
 
-        private static bool TestAABBFrustum(Bounds b, Plane[] planes)
+        private static bool TestAABBFrustum(float minX, float minY, float minZ,
+                                             float maxX, float maxY, float maxZ,
+                                             Plane[] planes)
         {
-            float minX = b.min.x, minY = b.min.y, minZ = b.min.z;
-            float maxX = b.max.x, maxY = b.max.y, maxZ = b.max.z;
             for (int i = 0; i < 6; i++)
             {
-                var   n = planes[i].normal;
-                float d = planes[i].distance;
+                var   n  = planes[i].normal;
+                float d  = planes[i].distance;
                 float px = n.x >= 0f ? maxX : minX;
                 float py = n.y >= 0f ? maxY : minY;
                 float pz = n.z >= 0f ? maxZ : minZ;
@@ -445,7 +445,7 @@ namespace StoryLabResearch.PointCloud
                 float effectiveThreshold = errorThreshold;
                 if (fovEnabled)
                 {
-                    float t = FoveationT(vpMatrix, fovInner, entry.WorldBounds, entry.ScreenError, halfFovTan);
+                    float t = FoveationT(vpMatrix, fovInner, entry.WorldCenter, entry.ScreenError, halfFovTan);
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
@@ -514,18 +514,17 @@ namespace StoryLabResearch.PointCloud
                 if (node.PointCount > maxPointCount) maxPointCount = node.PointCount;
 
                 float lodScale = node.LodScaleBase * pointSizeBase;
-                var   bn       = node.Bounds;
                 int   o        = validCount * 12;
 
                 // float4 a
-                _nodeDescriptorData[o + 0] = bn.min.x;
-                _nodeDescriptorData[o + 1] = bn.min.y;
-                _nodeDescriptorData[o + 2] = bn.min.z;
+                _nodeDescriptorData[o + 0] = node.BoundsMin.x;
+                _nodeDescriptorData[o + 1] = node.BoundsMin.y;
+                _nodeDescriptorData[o + 2] = node.BoundsMin.z;
                 _nodeDescriptorData[o + 3] = lodScale;
                 // float4 b
-                _nodeDescriptorData[o + 4] = bn.size.x;
-                _nodeDescriptorData[o + 5] = bn.size.y;
-                _nodeDescriptorData[o + 6] = bn.size.z;
+                _nodeDescriptorData[o + 4] = node.BoundsSize.x;
+                _nodeDescriptorData[o + 5] = node.BoundsSize.y;
+                _nodeDescriptorData[o + 6] = node.BoundsSize.z;
                 _nodeDescriptorData[o + 7] = 0f;
                 // uint4 c — reinterpret int bits into the float array
                 _nodeDescriptorData[o +  8] = BitConverter.Int32BitsToSingle(node.GlobalBufferOffset);
@@ -571,14 +570,15 @@ namespace StoryLabResearch.PointCloud
 
         // ----- Foveation helpers -----
 
-        // Returns t in [0,1]: 0 = inside foveal zone (no penalty), 1 = peripheral (full penalty).
+        // Returns t in [0,1]: 0 = inside foveal zone (no penalty), 1 = full peripheral penalty.
         // Uses Chebyshev distance in viewport space. Nodes whose projected extent overlaps the
         // inner zone are protected even if their centre lies outside it.
+        // t ramps linearly from 0 at the inner boundary to 1 over a zone of width fovInner,
+        // so fovInner controls both the protected radius and the transition speed.
         private float FoveationT(Matrix4x4 vpMatrix, float fovInner,
-            Bounds worldBounds, float screenError, float halfFovTan)
+            Vector3 worldCenter, float screenError, float halfFovTan)
         {
-            var  c = worldBounds.center;
-            var  h = vpMatrix * new Vector4(c.x, c.y, c.z, 1f);
+            var  h = vpMatrix * new Vector4(worldCenter.x, worldCenter.y, worldCenter.z, 1f);
             if (h.w <= 0f) return 0f; // centre behind camera — never penalise
             float invW = 1f / h.w;
             float vpx  = h.x * invW * 0.5f + 0.5f;
@@ -588,31 +588,60 @@ namespace StoryLabResearch.PointCloud
             float r    = Mathf.Max(dx, dy);
             // Subtract the node's projected half-extent so nodes straddling the boundary are protected.
             float nodeRadius = screenError * halfFovTan * 0.5f;
-            return (r - nodeRadius) > fovInner ? 1f : 0f;
+            float excess = (r - nodeRadius) - fovInner;
+            return fovInner > 0f ? Mathf.Clamp01(excess / fovInner) : (excess > 0f ? 1f : 0f);
         }
 
         // ----- Heap push/pop (max-heap on ScreenError) -----
 
         private void HeapPush(BVHNode node, BVHNode parent, Vector3 camPos, float halfFovTan,
-            Matrix4x4 localToWorld, bool occlusionCull)
+            Matrix4x4 m, bool occlusionCull)
         {
             if (node == null) return;
-            var worldBounds = TransformBounds(node.Bounds, localToWorld);
-            if (!TestAABBFrustum(worldBounds, _frustumPlanes)) return;
             if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
 
-            var closest = new Vector3(
-                Mathf.Clamp(camPos.x, worldBounds.min.x, worldBounds.max.x),
-                Mathf.Clamp(camPos.y, worldBounds.min.y, worldBounds.max.y),
-                Mathf.Clamp(camPos.z, worldBounds.min.z, worldBounds.max.z));
-            float sqrDist     = (camPos - closest).sqrMagnitude;
-            var   ext         = worldBounds.extents;
-            float maxExtent   = Mathf.Max(ext.x, Mathf.Max(ext.y, ext.z));
-            float rawError    = sqrDist > 0.000001f
+            // Inline TransformBounds using BoundsMin/BoundsSize — no Bounds construction, no property getters.
+            float lx = node.BoundsMin.x, ly = node.BoundsMin.y, lz = node.BoundsMin.z;
+            float sx = node.BoundsSize.x, sy = node.BoundsSize.y, sz = node.BoundsSize.z;
+            // Centre in local space = min + size*0.5
+            float cx = lx + sx * 0.5f, cy = ly + sy * 0.5f, cz = lz + sz * 0.5f;
+            // Transform centre
+            float wcx = m.m00 * cx + m.m01 * cy + m.m02 * cz + m.m03;
+            float wcy = m.m10 * cx + m.m11 * cy + m.m12 * cz + m.m13;
+            float wcz = m.m20 * cx + m.m21 * cy + m.m22 * cz + m.m23;
+            // Transform extents (half-size) — axis-aligned so take abs of each column
+            float ex = sx * 0.5f, ey = sy * 0.5f, ez = sz * 0.5f;
+            float wex = Mathf.Abs(m.m00) * ex + Mathf.Abs(m.m01) * ey + Mathf.Abs(m.m02) * ez;
+            float wey = Mathf.Abs(m.m10) * ex + Mathf.Abs(m.m11) * ey + Mathf.Abs(m.m12) * ez;
+            float wez = Mathf.Abs(m.m20) * ex + Mathf.Abs(m.m21) * ey + Mathf.Abs(m.m22) * ez;
+            float wminX = wcx - wex, wminY = wcy - wey, wminZ = wcz - wez;
+            float wmaxX = wcx + wex, wmaxY = wcy + wey, wmaxZ = wcz + wez;
+
+            // Inline frustum test — all floats, no Bounds/Plane property access in the loop.
+            var planes = _frustumPlanes;
+            for (int pi = 0; pi < 6; pi++)
+            {
+                var   n  = planes[pi].normal;
+                float d  = planes[pi].distance;
+                float px = n.x >= 0f ? wmaxX : wminX;
+                float py = n.y >= 0f ? wmaxY : wminY;
+                float pz = n.z >= 0f ? wmaxZ : wminZ;
+                if (n.x * px + n.y * py + n.z * pz + d < 0f) return;
+            }
+
+            // Screen error: closest point on AABB to camera, then maxExtent / (dist * halfFovTan).
+            float clampX  = camPos.x < wminX ? wminX : camPos.x > wmaxX ? wmaxX : camPos.x;
+            float clampY  = camPos.y < wminY ? wminY : camPos.y > wmaxY ? wmaxY : camPos.y;
+            float clampZ  = camPos.z < wminZ ? wminZ : camPos.z > wmaxZ ? wmaxZ : camPos.z;
+            float dx = camPos.x - clampX, dy = camPos.y - clampY, dz = camPos.z - clampZ;
+            float sqrDist   = dx * dx + dy * dy + dz * dz;
+            float maxExtent = wex > wey ? (wex > wez ? wex : wez) : (wey > wez ? wey : wez);
+            float rawError  = sqrDist > 0.000001f
                 ? maxExtent / (Mathf.Sqrt(sqrDist) * halfFovTan)
                 : float.MaxValue;
 
-            var entry = new QueueEntry(node, parent, rawError, worldBounds);
+            var worldCenter = new Vector3(wcx, wcy, wcz);
+            var entry = new QueueEntry(node, parent, rawError, worldCenter);
             _heap.Add(entry);
             int i = _heap.Count - 1;
             while (i > 0)
@@ -669,6 +698,7 @@ namespace StoryLabResearch.PointCloud
 
         // ----- Utilities -----
 
+        // Used only by the cold-path culling group sphere rebuild — hot path uses inlined HeapPush.
         private static Bounds TransformBounds(Bounds localBounds, Matrix4x4 m)
         {
             var center  = m.MultiplyPoint3x4(localBounds.center);
@@ -687,10 +717,10 @@ namespace StoryLabResearch.PointCloud
             public readonly BVHNode Node;
             public readonly BVHNode Parent;
             public readonly float   ScreenError;
-            public readonly Bounds  WorldBounds;
-            public QueueEntry(BVHNode node, BVHNode parent, float screenError, Bounds worldBounds)
+            public readonly Vector3 WorldCenter; // precomputed world-space centre, used by foveation
+            public QueueEntry(BVHNode node, BVHNode parent, float screenError, Vector3 worldCenter)
             {
-                Node = node; Parent = parent; ScreenError = screenError; WorldBounds = worldBounds;
+                Node = node; Parent = parent; ScreenError = screenError; WorldCenter = worldCenter;
             }
         }
 
