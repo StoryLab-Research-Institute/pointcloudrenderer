@@ -126,17 +126,6 @@ namespace StoryLabResearch.PointCloud
                 {
                     // Sidecar path: MyCloud_Quality.mat / MyCloud_Performance.mat next to the .ply.
                     var matAssetPath = Path.ChangeExtension(context.assetPath, null) + "_" + assetName + ".mat";
-                    var matFullPath  = Path.GetFullPath(
-                        Path.Combine(Application.dataPath, "..", matAssetPath));
-
-                    if (!File.Exists(matFullPath))
-                    {
-                        var copy = new Material(sourceMat) { name = assetName };
-                        // Write to disk and import immediately so AssetDatabase knows about it.
-                        AssetDatabase.CreateAsset(copy, matAssetPath);
-                        AssetDatabase.ImportAsset(matAssetPath,
-                            ImportAssetOptions.ForceSynchronousImport);
-                    }
 
                     var existing = AssetDatabase.LoadAssetAtPath<Material>(matAssetPath);
                     if (existing != null)
@@ -145,12 +134,22 @@ namespace StoryLabResearch.PointCloud
                         return existing;
                     }
 
-                    // Fallback: embed if sidecar write somehow failed.
-                    Debug.LogWarning($"[PlyImporter] Could not create extracted material at " +
-                                     $"'{matAssetPath}', falling back to embedded.");
-                    var fallback = new Material(sourceMat) { name = assetName };
-                    context.AddObjectToAsset(subAssetKey, fallback);
-                    return fallback;
+                    // Sidecar does not yet exist. AssetDatabase.CreateAsset is forbidden inside a
+                    // ScriptedImporter, so defer the write to after this import completes.
+                    // This import run embeds the material; Unity will re-import automatically when
+                    // the new .mat appears, at which point the extracted file will be used.
+                    var copy = new Material(sourceMat) { name = assetName };
+                    var capturedPath = matAssetPath;
+                    var capturedCopy = copy;
+                    EditorApplication.delayCall += () =>
+                    {
+                        if (AssetDatabase.LoadAssetAtPath<Material>(capturedPath) != null) return;
+                        AssetDatabase.CreateAsset(capturedCopy, capturedPath);
+                        AssetDatabase.ImportAsset(capturedPath, ImportAssetOptions.ForceSynchronousImport);
+                    };
+
+                    context.AddObjectToAsset(subAssetKey, copy);
+                    return copy;
                 }
 
                 default: // Shared
