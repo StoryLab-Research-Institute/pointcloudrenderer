@@ -33,21 +33,37 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Jitter frequency in Hz.")]
         public float JitterFrequency = 30f;
 
+        [Header("Smoothing")]
+        [Tooltip("Enable One Euro Filter on the final gaze output. " +
+                 "Suppresses jitter at fixation while passing saccades through unsmoothed.")]
+        public bool SmoothingEnabled = false;
+        [Tooltip("Minimum cutoff frequency (Hz). Lower = more smoothing at rest, more lag. " +
+                 "Controls how aggressively fixation noise is suppressed.")]
+        public float MinCutoff = 1f;
+        [Tooltip("Speed coefficient. Higher = less smoothing during fast movement. " +
+                 "Controls how quickly the filter opens up during saccades.")]
+        public float Beta = 10f;
+
         // Current gaze position written to the renderer each frame.
         private Vector2 _gazeCentre = new Vector2(0.5f, 0.5f);
         private Vector2 _gazeTarget = new Vector2(0.5f, 0.5f);
 
         // Random saccade state.
-        private float _saccadeTimer;
-        private float _saccadeDuration;
-        private bool  _inSaccade;
+        private float   _saccadeTimer;
+        private float   _saccadeDuration;
+        private bool    _inSaccade;
         private Vector2 _saccadeFrom;
         private Vector2 _saccadeTo;
 
         // Jitter state.
-        private float _jitterTimer;
+        private float   _jitterTimer;
         private Vector2 _jitterOffset;
         private Vector2 _jitterTarget;
+
+        // One Euro Filter state — one filter per axis.
+        private OneEuroFilter _filterX;
+        private OneEuroFilter _filterY;
+        private bool _filterInitialised;
 
         private void Update()
         {
@@ -56,8 +72,27 @@ namespace StoryLabResearch.PointCloud
             UpdateGaze();
             UpdateJitter();
 
+            Vector2 raw = _gazeCentre + (JitterEnabled ? _jitterOffset : Vector2.zero);
+
+            if (SmoothingEnabled)
+            {
+                if (!_filterInitialised)
+                {
+                    _filterX = new OneEuroFilter(raw.x, MinCutoff, Beta);
+                    _filterY = new OneEuroFilter(raw.y, MinCutoff, Beta);
+                    _filterInitialised = true;
+                }
+                raw = new Vector2(
+                    _filterX.Filter(raw.x, Time.deltaTime, MinCutoff, Beta),
+                    _filterY.Filter(raw.y, Time.deltaTime, MinCutoff, Beta));
+            }
+            else
+            {
+                _filterInitialised = false;
+            }
+
             if (_renderer != null)
-                _renderer.FoveationCentre = _gazeCentre + (JitterEnabled ? _jitterOffset : Vector2.zero);
+                _renderer.FoveationCentre = raw;
         }
 
         private void UpdateTarget()
@@ -76,7 +111,7 @@ namespace StoryLabResearch.PointCloud
                 if (_inSaccade)
                 {
                     // Saccade complete — begin fixation dwell (200-400ms).
-                    _inSaccade = false;
+                    _inSaccade    = false;
                     _saccadeTimer = Random.Range(0.2f, 0.4f);
                 }
                 else
@@ -132,6 +167,49 @@ namespace StoryLabResearch.PointCloud
             float u = 1f - Random.value;
             float v = Random.value;
             return Mathf.Sqrt(-2f * Mathf.Log(u)) * Mathf.Cos(2f * Mathf.PI * v);
+        }
+
+        // ----- One Euro Filter -----
+        // Jitter-adaptive low-pass filter. At low velocity (fixation) the cutoff is low → heavy
+        // smoothing. At high velocity (saccade) the cutoff rises → signal passes through unsmoothed.
+        // Reference: Casiez et al., "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy
+        // Input in Interactive Systems", CHI 2012.
+        private struct OneEuroFilter
+        {
+            private float _prev;
+            private float _prevDerivative;
+
+            public OneEuroFilter(float initialValue, float minCutoff, float beta)
+            {
+                _prev           = initialValue;
+                _prevDerivative = 0f;
+                _ = minCutoff; _ = beta; // consumed by Filter, not constructor
+            }
+
+            public float Filter(float x, float dt, float minCutoff, float beta)
+            {
+                // Derivative estimate — low-pass filtered to reduce noise amplification.
+                const float derivCutoff = 1f;
+                float alpha     = Alpha(dt, derivCutoff);
+                float dx        = dt > 0f ? (x - _prev) / dt : 0f;
+                float dxHat     = _prevDerivative + alpha * (dx - _prevDerivative);
+
+                // Adaptive cutoff: rises with signal speed, suppressing lag during fast movement.
+                float cutoff    = minCutoff + beta * Mathf.Abs(dxHat);
+                float alphaX    = Alpha(dt, cutoff);
+                float xHat      = _prev + alphaX * (x - _prev);
+
+                _prev           = xHat;
+                _prevDerivative = dxHat;
+                return xHat;
+            }
+
+            // EMA alpha from cutoff frequency and timestep.
+            private static float Alpha(float dt, float cutoff)
+            {
+                float tau = 1f / (2f * Mathf.PI * cutoff);
+                return 1f / (1f + tau / dt);
+            }
         }
 
 #if UNITY_EDITOR
