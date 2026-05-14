@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -118,6 +119,9 @@ namespace StoryLabResearch.PointCloud
 
         private PointCloudRenderProperties ActiveProperties => SharedRenderProperties.Resolve(ActiveTier);
 
+        // Exposed for editor gizmos (e.g. GazeControllerPrototype) — returns null if no SO assigned.
+        public PointCloudRenderProperties GetActivePropertiesForGizmo() => ActiveProperties;
+
         // Fallback values used when no render properties SO is assigned.
         private const int   DefaultPointBudget          = 2_000_000;
         private const float DefaultScreenErrorThreshold = 0.2f;
@@ -133,6 +137,10 @@ namespace StoryLabResearch.PointCloud
                                                     * MinDrawErrorMultiplier;
         private float P_PointSizeScale       => (ActiveProperties?.PointSizeScale     ?? DefaultPointSizeScale)
                                                     * PointSizeMultiplier;
+        // Fovea position in normalised viewport space. Defaults to screen centre.
+        // Assign from an external gaze controller to drive foveated LOD from gaze input.
+        [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
+
         private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
         private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
         private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 2f;
@@ -143,6 +151,19 @@ namespace StoryLabResearch.PointCloud
         private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
         private static readonly int PropLodScale         = Shader.PropertyToID("_LodScale");
         private static readonly int PropPointSize        = Shader.PropertyToID("_PointSize");
+
+        [Tooltip("Gizmo colour for this renderer. Leave alpha=0 to generate a random colour on first use.")]
+        [SerializeField] private Color _gizmoColor = Color.clear;
+
+        private Color GizmoColor
+        {
+            get
+            {
+                if (_gizmoColor.a == 0f)
+                    _gizmoColor = Color.HSVToRGB(UnityEngine.Random.value, 0.85f, 1f);
+                return new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 1f);
+            }
+        }
 
         // CullingGroup state — rebuilt whenever the asset or camera changes.
         private CullingGroup      _cullingGroup;
@@ -421,8 +442,11 @@ namespace StoryLabResearch.PointCloud
 
             float screenHalfH = rawError * halfFovTan * 0.5f / cam.aspect;
             float screenHalfV = rawError * halfFovTan * 0.5f;
-            float dx = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.x, 0f, 1f) - 0.5f) - screenHalfH);
-            float dy = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.y, 0f, 1f) - 0.5f) - screenHalfV) * cam.aspect;
+            // dx and dy both in raw viewport space (x: 0-1 = screen width, y: 0-1 = screen height).
+            // Mathf.Max gives Chebyshev distance — fovea zone is a square in viewport space,
+            // which is naturally wider than tall in pixels for landscape aspect ratios.
+            float dx = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.x, 0f, 1f) - FoveationCentre.x) - screenHalfH);
+            float dy = Mathf.Max(0f, Mathf.Abs(Mathf.Clamp(vp.y, 0f, 1f) - FoveationCentre.y) - screenHalfV);
             float r  = Mathf.Max(dx, dy);
             float outer = Mathf.Max(P_FoveationOuterRadius, P_FoveationInnerRadius + 0.001f);
             float t = Mathf.Clamp01((r - P_FoveationInnerRadius) / (outer - P_FoveationInnerRadius));
@@ -576,5 +600,43 @@ namespace StoryLabResearch.PointCloud
                     MeshTopology.Quads, _vertCount, 1, block);
             }
         }
+
+#if UNITY_EDITOR
+        private void OnDrawGizmos()
+        {
+            if (!P_FoveationEnabled) return;
+
+            var cam = Camera.current;
+            if (cam == null) return;
+
+            float inner = P_FoveationInnerRadius;
+            float outer = P_FoveationOuterRadius;
+            Vector2 centre = FoveationCentre;
+            float depth = (cam.nearClipPlane + cam.farClipPlane) * 0.5f;
+
+            Color solid = GizmoColor;
+            Color dim   = new Color(solid.r * 0.5f, solid.g * 0.5f, solid.b * 0.5f, 1f);
+
+            DrawFoveaRect(cam, centre, inner, solid, depth);
+            DrawFoveaRect(cam, centre, outer, dim,   depth);
+        }
+
+        private static void DrawFoveaRect(Camera cam, Vector2 vp, float r, Color color, float depth)
+        {
+            if (r <= 0f) return;
+
+            Vector3 tl = cam.ViewportToWorldPoint(new Vector3(vp.x - r, vp.y + r, depth));
+            Vector3 tr = cam.ViewportToWorldPoint(new Vector3(vp.x + r, vp.y + r, depth));
+            Vector3 br = cam.ViewportToWorldPoint(new Vector3(vp.x + r, vp.y - r, depth));
+            Vector3 bl = cam.ViewportToWorldPoint(new Vector3(vp.x - r, vp.y - r, depth));
+
+            UnityEditor.Handles.zTest = UnityEngine.Rendering.CompareFunction.Always;
+            UnityEditor.Handles.color = color;
+            UnityEditor.Handles.DrawLine(tl, tr);
+            UnityEditor.Handles.DrawLine(tr, br);
+            UnityEditor.Handles.DrawLine(br, bl);
+            UnityEditor.Handles.DrawLine(bl, tl);
+        }
+#endif
     }
 }
