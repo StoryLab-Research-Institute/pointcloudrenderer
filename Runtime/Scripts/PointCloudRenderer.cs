@@ -121,7 +121,7 @@ namespace StoryLabResearch.PointCloud
         private const int   DefaultPointBudget          = 2_000_000;
         private const float DefaultScreenErrorThreshold = 0.2f;
         private const float DefaultMinDrawErrorFraction = 0.1f;
-        private const float DefaultPointSizeScale       = 1.0f;
+        private const float DefaultPointSizeScale       = 0.01f;
 
         private int   P_PointBudget          => Mathf.Max(1, Mathf.RoundToInt(
                                                     (ActiveProperties?.PointBudget ?? DefaultPointBudget)
@@ -145,9 +145,8 @@ namespace StoryLabResearch.PointCloud
         private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.2f;
         private float P_LodHysteresis        => ActiveProperties?.LodHysteresis           ?? 0.2f;
 
-        private static readonly int PropLodScale   = Shader.PropertyToID("_LodScale");
-        private static readonly int PropPointSize  = Shader.PropertyToID("_PointSize");
-        private static readonly int PropPoints     = Shader.PropertyToID("_Points");
+        private static readonly int PropPoints          = Shader.PropertyToID("_Points");
+        private static readonly int PropNodeDescriptors = Shader.PropertyToID("_NodeDescriptors");
 
         [Tooltip("Gizmo colour for this renderer. Leave alpha=0 to generate a random colour on first use.")]
         [SerializeField] private Color _gizmoColor = Color.clear;
@@ -180,12 +179,19 @@ namespace StoryLabResearch.PointCloud
         private float[]          _selectedError     = new float[0];
         private readonly List<int> _selectedIndices = new List<int>();
 
-        private readonly List<NodeDrawable> _activeDrawables  = new List<NodeDrawable>();
-        private readonly List<NodeDrawable> _pendingDrawables = new List<NodeDrawable>();
-
         private readonly List<QueueEntry> _heap = new List<QueueEntry>();
 
         private readonly Plane[] _frustumPlanes = new Plane[6];
+
+        // Indirect draw state.
+        // NodeDescriptor layout (32 bytes = 8 floats):
+        //   [0] boundsMin.x, [1] boundsMin.y, [2] boundsMin.z, [3] pointOffset (as float bits)
+        //   [4] boundsSize.x, [5] boundsSize.y, [6] boundsSize.z, [7] pointCount (as float bits)
+        private GraphicsBuffer _nodeDescriptorBuffer; // StructuredBuffer<NodeDescriptor> on GPU
+        private GraphicsBuffer _indirectArgsBuffer;   // args for DrawProceduralIndirect
+        private float[]        _nodeDescriptorData;   // CPU-side staging, resized as needed
+        private uint[]         _indirectArgsData;     // CPU-side staging: [vertexCount, instanceCount, 0, 0]
+        private IndirectDrawable _indirectDrawable;   // single registered drawable
 
         private static bool TestAABBFrustum(Bounds b, Plane[] planes)
         {
@@ -203,9 +209,6 @@ namespace StoryLabResearch.PointCloud
             return true;
         }
 
-        private readonly List<NodeDrawable> _drawablePool = new List<NodeDrawable>();
-        private int _poolCursor;
-
         private void OnEnable()
         {
 #if UNITY_EDITOR
@@ -218,8 +221,9 @@ namespace StoryLabResearch.PointCloud
 #if UNITY_EDITOR
             UnityEditor.EditorApplication.update -= EditorTick;
 #endif
-            DeregisterAll();
+            DeregisterIndirect();
             DisposeCullingGroup();
+            DisposeIndirectBuffers();
             _assets.Quality?.Unload();
             _assets.Performance?.Unload();
         }
@@ -244,6 +248,7 @@ namespace StoryLabResearch.PointCloud
             if (asset != _lastActiveAsset)
             {
                 DisposeCullingGroup();
+                DisposeIndirectBuffers();
                 _selectedIndices.Clear();
                 _lastActiveAsset = asset;
             }
@@ -255,16 +260,7 @@ namespace StoryLabResearch.PointCloud
                 EnsureNodeIndex(asset);
             }
 
-            _pendingDrawables.Clear();
-            _poolCursor = 0;
             SelectNodes(cam, asset);
-
-            DeregisterAll();
-            foreach (var d in _pendingDrawables)
-            {
-                PointCloudRenderFeature.PointCloudRenderPass.Register(d);
-                _activeDrawables.Add(d);
-            }
         }
 
         private Camera ResolveCamera()
@@ -401,10 +397,8 @@ namespace StoryLabResearch.PointCloud
             var   vpMatrix       = cam.projectionMatrix * cam.worldToCameraMatrix;
 
             var   mat           = ActiveMaterial;
-            float pointSizeBase = mat.GetFloat(PropPointSize) * P_PointSizeScale * 0.5f;
+            float pointSizeBase = P_PointSizeScale * 0.5f;
 
-            // Bind the global point buffer once on the material — all nodes share it,
-            // and per-node _PointOffset in the PropertyBlock selects each node's slice.
             if (asset.GlobalPointBuffer != null)
                 mat.SetBuffer(PropPoints, asset.GlobalPointBuffer);
 
@@ -468,29 +462,109 @@ namespace StoryLabResearch.PointCloud
                 remaining -= node.PointCount;
             }
 
-            // Emit draw calls.
+            // Build indirect draw — one instanced call covering all selected nodes.
+            // NodeDescriptor layout in _nodeDescriptorBuffer (48 bytes = 3 float4s):
+            //   float4 a: boundsMin.xyz,  lodScale
+            //   float4 b: boundsSize.xyz, <unused/pad>
+            //   uint4  c: pointOffset, pointCount, 0, 0
             LastFramePointsDrawn = 0;
-            float minDrawError = errorThreshold * minDrawFrac;
+            float minDrawError   = errorThreshold * minDrawFrac;
 
+            // First pass: count valid nodes and find max point count (vertex count per instance).
+            int validCount    = 0;
+            int maxPointCount = 0;
             foreach (int idx in _selectedIndices)
             {
                 var   node        = _cullingNodes[idx];
                 float screenError = _selectedError[idx];
-
                 if (node.PointCount == 0) continue;
                 if (minDrawFrac > 0f && screenError < minDrawError) continue;
+                bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
+                bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
+                if (leftSelected && rightSelected) continue;
+                validCount++;
+                if (node.PointCount > maxPointCount) maxPointCount = node.PointCount;
+            }
 
-                // Skip a node if both children are already selected — children cover the space completely.
+            if (validCount == 0)
+            {
+                DeregisterIndirect();
+                (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
+                return;
+            }
+
+            // Ensure GPU buffers are large enough (grow only, never shrink).
+            // Each descriptor is 48 bytes = 12 floats.
+            int descriptorFloats = validCount * 12;
+            if (_nodeDescriptorData == null || _nodeDescriptorData.Length < descriptorFloats)
+            {
+                _nodeDescriptorBuffer?.Release();
+                // 3 float4s per node (48 bytes), stored as validCount*3 float4 elements (stride 16).
+                _nodeDescriptorBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount * 3, 16);
+                _nodeDescriptorData   = new float[descriptorFloats];
+            }
+            if (_indirectArgsBuffer == null)
+            {
+                // 4 uints: vertexCount, instanceCount, startVertex, startInstance.
+                _indirectArgsBuffer = new GraphicsBuffer(
+                    GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint));
+                _indirectArgsData = new uint[4];
+            }
+
+            // Second pass: fill descriptor CPU array.
+            int di = 0;
+            foreach (int idx in _selectedIndices)
+            {
+                var   node        = _cullingNodes[idx];
+                float screenError = _selectedError[idx];
+                if (node.PointCount == 0) continue;
+                if (minDrawFrac > 0f && screenError < minDrawError) continue;
                 bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
                 bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
                 if (leftSelected && rightSelected) continue;
 
                 float ratio    = node.OriginalCount > 0 ? (float)node.OriginalCount / node.PointCount : 1f;
                 float lodScale = Mathf.Sqrt(ratio) * pointSizeBase;
+                var   bn       = node.Bounds;
+                int   o        = di * 12;
 
-                _pendingDrawables.Add(GetDrawable(node, mat, localToWorld, node.PointCount, lodScale));
+                // float4 a
+                _nodeDescriptorData[o + 0] = bn.min.x;
+                _nodeDescriptorData[o + 1] = bn.min.y;
+                _nodeDescriptorData[o + 2] = bn.min.z;
+                _nodeDescriptorData[o + 3] = lodScale;
+                // float4 b
+                _nodeDescriptorData[o + 4] = bn.size.x;
+                _nodeDescriptorData[o + 5] = bn.size.y;
+                _nodeDescriptorData[o + 6] = bn.size.z;
+                _nodeDescriptorData[o + 7] = 0f;
+                // uint4 c — reinterpret int bits into the float array using BitConverter
+                _nodeDescriptorData[o +  8] = BitConverter.Int32BitsToSingle(node.GlobalBufferOffset);
+                _nodeDescriptorData[o +  9] = BitConverter.Int32BitsToSingle(node.PointCount);
+                _nodeDescriptorData[o + 10] = 0f;
+                _nodeDescriptorData[o + 11] = 0f;
+
+                di++;
                 LastFramePointsDrawn += node.PointCount;
             }
+
+            // Upload descriptors (validCount * 3 float4s = validCount * 12 floats) and indirect args.
+            _nodeDescriptorBuffer.SetData(_nodeDescriptorData, 0, 0, validCount * 12);
+            _indirectArgsData[0] = (uint)(maxPointCount * 6); // vertexCount: 6 verts per point (2 triangles)
+            _indirectArgsData[1] = (uint)validCount;          // instanceCount: one per node
+            _indirectArgsData[2] = 0;
+            _indirectArgsData[3] = 0;
+            _indirectArgsBuffer.SetData(_indirectArgsData);
+
+            // Bind buffers to material.
+            mat.SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer);
+
+            if (_indirectDrawable == null)
+            {
+                _indirectDrawable = new IndirectDrawable();
+                PointCloudRenderFeature.PointCloudRenderPass.Register(_indirectDrawable);
+            }
+            _indirectDrawable.Set(mat, _indirectArgsBuffer, localToWorld);
 
             // Swap expanded-flags arrays: this frame's expansions become next frame's hysteresis reference.
             (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
@@ -574,24 +648,23 @@ namespace StoryLabResearch.PointCloud
             return top;
         }
 
-        // ----- NodeDrawable pool -----
+        // ----- Indirect draw helpers -----
 
-        private NodeDrawable GetDrawable(BVHNode node, Material material,
-            Matrix4x4 localToWorld, int vertCount, float lodScale)
+        private void DeregisterIndirect()
         {
-            NodeDrawable d;
-            if (_poolCursor < _drawablePool.Count)
-            {
-                d = _drawablePool[_poolCursor++];
-            }
-            else
-            {
-                d = new NodeDrawable();
-                _drawablePool.Add(d);
-                _poolCursor++;
-            }
-            d.Set(node, material, localToWorld, vertCount, lodScale);
-            return d;
+            if (_indirectDrawable == null) return;
+            PointCloudRenderFeature.PointCloudRenderPass.Deregister(_indirectDrawable);
+            _indirectDrawable = null;
+        }
+
+        private void DisposeIndirectBuffers()
+        {
+            _nodeDescriptorBuffer?.Release();
+            _nodeDescriptorBuffer = null;
+            _indirectArgsBuffer?.Release();
+            _indirectArgsBuffer   = null;
+            _nodeDescriptorData   = null;
+            _indirectArgsData     = null;
         }
 
         // ----- Utilities -----
@@ -605,13 +678,6 @@ namespace StoryLabResearch.PointCloud
                 Mathf.Abs(m.m10) * extents.x + Mathf.Abs(m.m11) * extents.y + Mathf.Abs(m.m12) * extents.z,
                 Mathf.Abs(m.m20) * extents.x + Mathf.Abs(m.m21) * extents.y + Mathf.Abs(m.m22) * extents.z);
             return new Bounds(center, newExtents * 2f);
-        }
-
-        private void DeregisterAll()
-        {
-            foreach (var d in _activeDrawables)
-                PointCloudRenderFeature.PointCloudRenderPass.Deregister(d);
-            _activeDrawables.Clear();
         }
 
         // ----- Inner types -----
@@ -628,30 +694,23 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private sealed class NodeDrawable : IPointCloudDrawable
+        private sealed class IndirectDrawable : IPointCloudDrawable
         {
-            private BVHNode   _node;
-            private Material  _material;
-            private Matrix4x4 _localToWorld;
-            private int       _vertCount;
-            private float     _lodScale;
+            private Material       _material;
+            private GraphicsBuffer _argsBuffer;
+            private Matrix4x4      _localToWorld;
 
-            public void Set(BVHNode node, Material material,
-                Matrix4x4 localToWorld, int vertCount, float lodScale)
+            public void Set(Material material, GraphicsBuffer argsBuffer, Matrix4x4 localToWorld)
             {
-                _node         = node;
                 _material     = material;
+                _argsBuffer   = argsBuffer;
                 _localToWorld = localToWorld;
-                _vertCount    = vertCount * 4; // 4 vertices per point quad
-                _lodScale     = lodScale;
             }
 
             public void Draw(RasterCommandBuffer cmd)
             {
-                var block = _node.PropertyBlock;
-                block.SetFloat(PropLodScale, _lodScale);
-                cmd.DrawProcedural(_localToWorld, _material, 0,
-                    MeshTopology.Quads, _vertCount, 1, block);
+                cmd.DrawProceduralIndirect(_localToWorld, _material, 0,
+                    MeshTopology.Triangles, _argsBuffer);
             }
         }
 

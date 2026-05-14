@@ -20,7 +20,6 @@ Shader "StoryLab PointCloud/URP Octree"
 {
     Properties
     {
-        _PointSize("Point Size", Float) = 0.02
         [KeywordEnum(Vertex, Solid, Blend)] _ColorMode("Color Mode", int) = 0
         _Color("Color", Color) = (1,1,1,1)
         _ColorBlend("Color Blend", Range(0,1)) = 0
@@ -42,7 +41,6 @@ Shader "StoryLab PointCloud/URP Octree"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
             CBUFFER_START(UnityPerMaterial)
-                float _PointSize;
                 half4 _Color;
                 float _ColorBlend;
             CBUFFER_END
@@ -51,22 +49,31 @@ Shader "StoryLab PointCloud/URP Octree"
             //   .x = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
             //   .y = RGB24 in bits 0-23            — bits 24-31 unused/spare
             //   .z = uint16_z in bits 0-15         — Z quantized [0,65535], upper 16 bits spare
-            // Bound once on the material; _PointOffset (per-node PropertyBlock) selects this node's slice.
             ByteAddressBuffer _Points;
-            int   _PointOffset; // offset in points into _Points for this node
-            float3 _BoundsMin;
-            float3 _BoundsSize;
-            float _LodScale; // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
 
-            // Square/circle: axis-aligned quad. Corner order TL, BL, BR, TR.
-            static const float2 _CornerOffset[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
-            // Diamond: rotated 45° — corners at cardinal points (top, left, bottom, right).
-            // Geometry IS the diamond shape; no fragment clip required.
-            static const float2 _DiamondOffset[4] = { float2(0,1), float2(-1,0), float2(0,-1), float2(1,0) };
+            // Per-selected-node descriptors. Each entry is 3 float4s (48 bytes, stride=48):
+            //   [0] float4: boundsMin.xyz, lodScale
+            //   [1] float4: boundsSize.xyz, <pad>
+            //   [2] uint4:  pointOffset, pointCount, 0, 0  (stored as raw uint bits)
+            // Indexed by SV_InstanceID — one instance per selected node.
+            StructuredBuffer<float4> _NodeDescriptors;
+
+            // Two triangles per point (6 verts). Tri 0: TL,BL,BR  Tri 1: TL,BR,TR.
+            // Square/circle corners: TL, BL, BR, TR.
+            static const float2 _CornerOffset[6] = {
+                float2(-1, 1), float2(-1,-1), float2( 1,-1),
+                float2(-1, 1), float2( 1,-1), float2( 1, 1)
+            };
+            // Diamond: rotated 45°. Top, Left, Bottom, Right → same two-triangle split.
+            static const float2 _DiamondOffset[6] = {
+                float2( 0, 1), float2(-1, 0), float2( 0,-1),
+                float2( 0, 1), float2( 0,-1), float2( 1, 0)
+            };
 
             struct a2v
             {
-                uint vertexID : SV_VertexID;
+                uint vertexID   : SV_VertexID;
+                uint instanceID : SV_InstanceID;
             };
 
             struct v2f
@@ -95,19 +102,41 @@ Shader "StoryLab PointCloud/URP Octree"
 
             v2f vert(a2v input)
             {
-                // Each point is 12 bytes (uint3). Offset by _PointOffset points into the global buffer.
-                uint pointIndex = (uint)_PointOffset + input.vertexID / 4;
-                uint byteAddr   = pointIndex * 12u;
-                uint3 pt = _Points.Load3(byteAddr);
-                uint  corner = input.vertexID % 4;
+                // Look up this instance's node descriptor (3 consecutive float4s).
+                uint base3      = input.instanceID * 3u;
+                float4 descA    = _NodeDescriptors[base3 + 0u]; // boundsMin.xyz, lodScale
+                float4 descB    = _NodeDescriptors[base3 + 1u]; // boundsSize.xyz, <pad>
+                float4 descC    = _NodeDescriptors[base3 + 2u]; // pointOffset, pointCount (as uint bits)
+
+                uint pointOffset = asuint(descC.x);
+                uint pointCount  = asuint(descC.y);
+                uint localIndex  = input.vertexID / 6u;
+
+                // Discard vertices that exceed this node's point count (padding from maxPointCount).
+                v2f o;
+                ZERO_INITIALIZE(v2f, o);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+                if (localIndex >= pointCount)
+                {
+                    o.clipPos = float4(2, 2, 2, 1); // outside clip space — discarded by rasterizer
+                    return o;
+                }
+
+                uint byteAddr = (pointOffset + localIndex) * 12u;
+                uint3 pt      = _Points.Load3(byteAddr);
+                uint  corner  = input.vertexID % 6u;
             #if _POINTSHAPE_DIAMOND
                 float2 offset = _DiamondOffset[corner];
             #else
                 float2 offset = _CornerOffset[corner];
             #endif
 
+                float3 boundsMin  = descA.xyz;
+                float3 boundsSize = descB.xyz;
+                float  lodScale   = descA.w;
+
                 // Dequantize position from uint16 unorm to world space.
-                float3 pos = _BoundsMin + _BoundsSize * float3(
+                float3 pos = boundsMin + boundsSize * float3(
                     (pt.x & 0xFFFFu) * (1.0 / 65535.0),
                     (pt.x >> 16)     * (1.0 / 65535.0),
                     (pt.z & 0xFFFFu) * (1.0 / 65535.0));
@@ -126,7 +155,7 @@ Shader "StoryLab PointCloud/URP Octree"
                 // so this is correct for both eyes without any CPU-side per-eye work.
                 float2 screenExtent = float2(
                     abs(UNITY_MATRIX_P._m00),
-                    abs(UNITY_MATRIX_P._m11)) * _LodScale;
+                    abs(UNITY_MATRIX_P._m11)) * lodScale;
 
                 // 1px minimum: 2/screenHeight in NDC (clip.w ≈ 1 at typical VR distances, close enough).
                 float minExtent = 2.0 / _ScreenParams.y;
@@ -134,9 +163,6 @@ Shader "StoryLab PointCloud/URP Octree"
 
                 clipPos.xy += offset * screenExtent;
 
-                v2f o;
-                ZERO_INITIALIZE(v2f, o);
-                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
                 o.clipPos = clipPos;
                 o.color   = color;
             #if _POINTSHAPE_CIRCLE

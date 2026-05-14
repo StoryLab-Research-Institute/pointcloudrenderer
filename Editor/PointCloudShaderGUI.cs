@@ -6,9 +6,6 @@ namespace StoryLabResearch.PointCloud
     {
         public override void OnGUI(MaterialEditor materialEditor, MaterialProperty[] properties)
         {
-            MaterialProperty _PointSize = FindProperty("_PointSize", properties);
-            materialEditor.ShaderProperty(_PointSize, _PointSize.displayName);
-
             MaterialProperty _ColorMode = FindProperty("_ColorMode", properties);
             materialEditor.ShaderProperty(_ColorMode, _ColorMode.displayName);
 

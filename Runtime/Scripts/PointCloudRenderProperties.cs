@@ -20,9 +20,9 @@ namespace StoryLabResearch.PointCloud
                  "Culls sub-pixel nodes that contribute overdraw with no visual benefit. 0 = disabled.")]
         public float MinDrawErrorFraction = 0.1f;
 
-        [Tooltip("Global point size multiplier on top of the material's _PointSize. " +
-                 "The per-node scale is derived from the subsampling ratio.")]
-        public float PointSizeScale = 1.0f;
+        [Tooltip("Base point size in screen-space NDC half-extents. " +
+                 "The per-node scale is derived from the subsampling ratio and multiplied by this value.")]
+        public float PointSizeScale = 0.01f;
 
         [Tooltip("Use Unity's occlusion bake to skip nodes hidden behind scene geometry. " +
                  "Only active in player builds — the editor does not run the occlusion rasteriser.")]
