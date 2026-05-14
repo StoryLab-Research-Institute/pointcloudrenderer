@@ -47,12 +47,13 @@ Shader "StoryLab PointCloud/URP Octree"
                 float _ColorBlend;
             CBUFFER_END
 
-            // Set per-node via MaterialPropertyBlock.
-            // uint3 per point (12 bytes, one cache line):
+            // Global point buffer shared across all nodes. uint3 per point (12 bytes):
             //   .x = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
             //   .y = RGB24 in bits 0-23            — bits 24-31 unused/spare
             //   .z = uint16_z in bits 0-15         — Z quantized [0,65535], upper 16 bits spare
-            StructuredBuffer<uint3> _Points;
+            // Bound once on the material; _PointOffset (per-node PropertyBlock) selects this node's slice.
+            ByteAddressBuffer _Points;
+            int   _PointOffset; // offset in points into _Points for this node
             float3 _BoundsMin;
             float3 _BoundsSize;
             float _LodScale; // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
@@ -94,7 +95,10 @@ Shader "StoryLab PointCloud/URP Octree"
 
             v2f vert(a2v input)
             {
-                uint3 pt     = _Points[input.vertexID / 4];
+                // Each point is 12 bytes (uint3). Offset by _PointOffset points into the global buffer.
+                uint pointIndex = (uint)_PointOffset + input.vertexID / 4;
+                uint byteAddr   = pointIndex * 12u;
+                uint3 pt = _Points.Load3(byteAddr);
                 uint  corner = input.vertexID % 4;
             #if _POINTSHAPE_DIAMOND
                 float2 offset = _DiamondOffset[corner];

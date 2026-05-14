@@ -145,8 +145,9 @@ namespace StoryLabResearch.PointCloud
         private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.2f;
         private float P_LodHysteresis        => ActiveProperties?.LodHysteresis           ?? 0.2f;
 
-        private static readonly int PropLodScale  = Shader.PropertyToID("_LodScale");
-        private static readonly int PropPointSize = Shader.PropertyToID("_PointSize");
+        private static readonly int PropLodScale   = Shader.PropertyToID("_LodScale");
+        private static readonly int PropPointSize  = Shader.PropertyToID("_PointSize");
+        private static readonly int PropPoints     = Shader.PropertyToID("_Points");
 
         [Tooltip("Gizmo colour for this renderer. Leave alpha=0 to generate a random colour on first use.")]
         [SerializeField] private Color _gizmoColor = Color.clear;
@@ -401,6 +402,11 @@ namespace StoryLabResearch.PointCloud
 
             var   mat           = ActiveMaterial;
             float pointSizeBase = mat.GetFloat(PropPointSize) * P_PointSizeScale * 0.5f;
+
+            // Bind the global point buffer once on the material — all nodes share it,
+            // and per-node _PointOffset in the PropertyBlock selects each node's slice.
+            if (asset.GlobalPointBuffer != null)
+                mat.SetBuffer(PropPoints, asset.GlobalPointBuffer);
 
             // Reset per-frame selection state — only touch indices written last frame.
             foreach (int idx in _selectedIndices)
