@@ -69,12 +69,12 @@ namespace StoryLabResearch.PointCloud
             var qualityTier     = R_Quality;
             var performanceTier = R_Performance;
 
-            var qualityAsset = OctreeBuilder.BuildFromPointsEmbedded(
-                positions, colors, qualityTier.MinPointSpacing);
+            var qualityAsset = BVHBuilder.BuildFromPointsEmbedded(
+                positions, colors, qualityTier.MinPointSpacing, qualityTier.MaxNodeSideLength);
             if (qualityAsset == null) return;
 
-            var performanceAsset = OctreeBuilder.BuildFromPointsEmbedded(
-                positions, colors, performanceTier.MinPointSpacing);
+            var performanceAsset = BVHBuilder.BuildFromPointsEmbedded(
+                positions, colors, performanceTier.MinPointSpacing, performanceTier.MaxNodeSideLength);
             if (performanceAsset == null) return;
 
             qualityAsset.name     = name + "_Quality";
@@ -86,7 +86,7 @@ namespace StoryLabResearch.PointCloud
 
             // Build the prefab.
             var go = new GameObject(name);
-            var renderer = go.AddComponent<OctreeRenderer>();
+            var renderer = go.AddComponent<PointCloudRenderer>();
 
             renderer.SetImportedAsset(
                 new PerPlatformAssets    { Quality = qualityAsset,  Performance = performanceAsset },
@@ -97,8 +97,8 @@ namespace StoryLabResearch.PointCloud
                     Performance = performanceTier.RenderProperties,
                 });
 
-            context.AddObjectToAsset("octree_quality",     qualityAsset);
-            context.AddObjectToAsset("octree_performance", performanceAsset);
+            context.AddObjectToAsset("bvh_quality",     qualityAsset);
+            context.AddObjectToAsset("bvh_performance", performanceAsset);
             context.AddObjectToAsset("prefab", go);
             context.SetMainObject(go);
         }

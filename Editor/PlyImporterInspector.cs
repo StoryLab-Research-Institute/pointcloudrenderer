@@ -145,8 +145,8 @@ namespace StoryLabResearch.PointCloud
                 var renderProp = tier.FindPropertyRelative(nameof(PlatformImportTier.RenderProperties));
                 EditorGUILayout.PropertyField(renderProp,
                     new GUIContent("Render Properties",
-                        "Render settings applied to the imported OctreeRenderer for this tier. " +
-                        "Leave unset to use OctreeRenderer built-in defaults."));
+                        "Render settings applied to the imported PointCloudRenderer for this tier. " +
+                        "Leave unset to use PointCloudRenderer built-in defaults."));
 
                 EditorGUI.indentLevel--;
             }

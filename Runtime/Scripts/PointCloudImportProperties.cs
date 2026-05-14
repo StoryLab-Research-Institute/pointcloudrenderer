@@ -26,17 +26,17 @@ namespace StoryLabResearch.PointCloud
 
     // Per-platform point cloud assets.
     // Both assets are sub-assets of the imported .ply prefab; only the active tier's
-    // .bin data is ever loaded into memory (OctreeAsset.Load() is called on demand).
+    // .bin data is ever loaded into memory (BVHAsset.Load() is called on demand).
     [System.Serializable]
     public struct PerPlatformAssets
     {
-        [Tooltip("Octree asset for high-end platforms (PC, Mac, consoles).")]
-        public OctreeAsset Quality;
+        [Tooltip("BVH asset for high-end platforms (PC, Mac, consoles).")]
+        public BVHAsset Quality;
 
-        [Tooltip("Octree asset for performance platforms (Android, Quest).")]
-        public OctreeAsset Performance;
+        [Tooltip("BVH asset for performance platforms (Android, Quest).")]
+        public BVHAsset Performance;
 
-        public OctreeAsset Resolve(EPlatformTier tier) =>
+        public BVHAsset Resolve(EPlatformTier tier) =>
             tier == EPlatformTier.Performance ? Performance : Quality;
     }
 
@@ -58,6 +58,11 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Cull points closer together than this distance. 0 = disabled.")]
         public float MinPointSpacing;
 
+        [Tooltip("Maximum side length of a BVH node's bounding box before it is forced to split, " +
+                 "even if point count is below the leaf threshold. Produces tighter bounds in sparse " +
+                 "regions, improving frustum culling and LOD accuracy. 0 = disabled.")]
+        public float MaxNodeSideLength;
+
         [Tooltip("Source material for this tier. Leave empty to use the pipeline default.")]
         public Material Material;
 
@@ -66,8 +71,8 @@ namespace StoryLabResearch.PointCloud
                  "Extracted: write a standalone .mat file next to the .ply.")]
         public PointCloudImportProperties.EMaterialMode MaterialMode;
 
-        [Tooltip("Render properties applied to the imported OctreeRenderer for this tier. " +
-                 "Leave unset to use OctreeRenderer built-in defaults.")]
+        [Tooltip("Render properties applied to the imported renderer for this tier. " +
+                 "Leave unset to use built-in defaults.")]
         public LazyLoadReference<PointCloudRenderProperties> RenderProperties;
     }
 

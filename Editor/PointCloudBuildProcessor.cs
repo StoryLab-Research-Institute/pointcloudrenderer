@@ -30,7 +30,7 @@ namespace StoryLabResearch.PointCloud
             // Render property GUIDs (PointCloudRenderProperties SOs)
             public string qualityRenderGuid;
             public string performanceRenderGuid;
-            // Asset GUIDs (OctreeAsset sub-assets — identified by asset path + name)
+            // Asset GUIDs (BVHAsset sub-assets — identified by asset path + name)
             public string qualityAssetPath;
             public string qualityAssetName;
             public string performanceAssetPath;
@@ -52,18 +52,18 @@ namespace StoryLabResearch.PointCloud
 
             foreach (var (scene, scenePath) in OpenBuildScenes())
             {
-                foreach (var renderer in FindAll<OctreeRenderer>(scene))
+                foreach (var renderer in FindAll<PointCloudRenderer>(scene))
                 {
                     var props  = renderer.SharedRenderPropertiesForBuild;
                     var assets = renderer.AssetsForBuild;
 
                     var qualityRenderAsset     = props.Quality.isSet     ? props.Quality.asset     : null;
                     var performanceRenderAsset = props.Performance.isSet ? props.Performance.asset : null;
-                    var qualityOctree          = assets.Quality;
-                    var performanceOctree      = assets.Performance;
+                    var qualityAsset          = assets.Quality;
+                    var performanceAsset      = assets.Performance;
 
-                    bool hasQuality     = qualityRenderAsset != null || qualityOctree != null;
-                    bool hasPerformance = performanceRenderAsset != null || performanceOctree != null;
+                    bool hasQuality     = qualityRenderAsset != null || qualityAsset != null;
+                    bool hasPerformance = performanceRenderAsset != null || performanceAsset != null;
 
                     if (stripQuality && hasQuality)
                     {
@@ -73,10 +73,10 @@ namespace StoryLabResearch.PointCloud
                             gameObjectPath         = GetPath(renderer.gameObject),
                             qualityRenderGuid      = GuidOf(qualityRenderAsset),
                             performanceRenderGuid  = GuidOf(performanceRenderAsset),
-                            qualityAssetPath       = qualityOctree != null ? AssetDatabase.GetAssetPath(qualityOctree) : "",
-                            qualityAssetName       = qualityOctree != null ? qualityOctree.name : "",
-                            performanceAssetPath   = performanceOctree != null ? AssetDatabase.GetAssetPath(performanceOctree) : "",
-                            performanceAssetName   = performanceOctree != null ? performanceOctree.name : "",
+                            qualityAssetPath       = qualityAsset != null ? AssetDatabase.GetAssetPath(qualityAsset) : "",
+                            qualityAssetName       = qualityAsset != null ? qualityAsset.name : "",
+                            performanceAssetPath   = performanceAsset != null ? AssetDatabase.GetAssetPath(performanceAsset) : "",
+                            performanceAssetName   = performanceAsset != null ? performanceAsset.name : "",
                         });
 
                         renderer.SharedRenderPropertiesForBuild = new PerPlatformRenderProperties
@@ -99,10 +99,10 @@ namespace StoryLabResearch.PointCloud
                             gameObjectPath         = GetPath(renderer.gameObject),
                             qualityRenderGuid      = GuidOf(qualityRenderAsset),
                             performanceRenderGuid  = GuidOf(performanceRenderAsset),
-                            qualityAssetPath       = qualityOctree != null ? AssetDatabase.GetAssetPath(qualityOctree) : "",
-                            qualityAssetName       = qualityOctree != null ? qualityOctree.name : "",
-                            performanceAssetPath   = performanceOctree != null ? AssetDatabase.GetAssetPath(performanceOctree) : "",
-                            performanceAssetName   = performanceOctree != null ? performanceOctree.name : "",
+                            qualityAssetPath       = qualityAsset != null ? AssetDatabase.GetAssetPath(qualityAsset) : "",
+                            qualityAssetName       = qualityAsset != null ? qualityAsset.name : "",
+                            performanceAssetPath   = performanceAsset != null ? AssetDatabase.GetAssetPath(performanceAsset) : "",
+                            performanceAssetName   = performanceAsset != null ? performanceAsset.name : "",
                         });
 
                         renderer.SharedRenderPropertiesForBuild = new PerPlatformRenderProperties
@@ -141,11 +141,11 @@ namespace StoryLabResearch.PointCloud
 
             var dirty = new HashSet<UnityEngine.Object>();
 
-            var sceneRenderers = new Dictionary<string, Dictionary<string, OctreeRenderer>>();
+            var sceneRenderers = new Dictionary<string, Dictionary<string, PointCloudRenderer>>();
             foreach (var (scene, scenePath) in OpenBuildScenes())
             {
-                var byPath = new Dictionary<string, OctreeRenderer>();
-                foreach (var r in FindAll<OctreeRenderer>(scene))
+                var byPath = new Dictionary<string, PointCloudRenderer>();
+                foreach (var r in FindAll<PointCloudRenderer>(scene))
                     byPath[GetPath(r.gameObject)] = r;
                 sceneRenderers[scenePath] = byPath;
             }
@@ -164,7 +164,7 @@ namespace StoryLabResearch.PointCloud
                     }
                     if (!string.IsNullOrEmpty(rec.qualityAssetPath))
                     {
-                        var asset = LoadSubAsset<OctreeAsset>(rec.qualityAssetPath, rec.qualityAssetName);
+                        var asset = LoadSubAsset<BVHAsset>(rec.qualityAssetPath, rec.qualityAssetName);
                         if (asset != null) { renderer.RestoreQualityAsset(asset); dirty.Add(renderer); }
                     }
                 }
@@ -177,7 +177,7 @@ namespace StoryLabResearch.PointCloud
                     }
                     if (!string.IsNullOrEmpty(rec.performanceAssetPath))
                     {
-                        var asset = LoadSubAsset<OctreeAsset>(rec.performanceAssetPath, rec.performanceAssetName);
+                        var asset = LoadSubAsset<BVHAsset>(rec.performanceAssetPath, rec.performanceAssetName);
                         if (asset != null) { renderer.RestorePerformanceAsset(asset); dirty.Add(renderer); }
                     }
                 }

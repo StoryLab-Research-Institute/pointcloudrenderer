@@ -1,5 +1,5 @@
 // Prototype gaze controller for testing foveated LOD without eye-tracking hardware.
-// Not intended for distribution — attach to any GameObject in the scene alongside an OctreeRenderer.
+// Not intended for distribution — attach to any GameObject in the scene alongside an PointCloudRenderer.
 
 using UnityEngine;
 
@@ -13,7 +13,7 @@ namespace StoryLabResearch.PointCloud
             Random,  // pseudo-realistic saccade simulation
         }
 
-        private OctreeRenderer _renderer;
+        private PointCloudRenderer _renderer;
 
         [Header("Target")]
         public EGazeMode Mode = EGazeMode.Fixed;
@@ -67,7 +67,7 @@ namespace StoryLabResearch.PointCloud
 
         private void Update()
         {
-            if (_renderer == null) _renderer = GetComponent<OctreeRenderer>();
+            if (_renderer == null) _renderer = GetComponent<PointCloudRenderer>();
             UpdateTarget();
             UpdateGaze();
             UpdateJitter();

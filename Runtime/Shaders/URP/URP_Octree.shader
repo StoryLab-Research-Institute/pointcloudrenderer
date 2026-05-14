@@ -1,19 +1,19 @@
 /*
 Chris Nightingale, 2025
 
-Octree point cloud renderer.
+BVH point cloud renderer.
 
 Replaces the geometry shader approach with StructuredBuffer + vertex shader,
 which runs identically on Android (Quest 3+) and desktop — no geometry shader
 required, no fallback path needed.
 
 Points are driven via DrawProcedural from OctreeRenderer. Each draw call
-covers one octree node; _Points is set per-node via MaterialPropertyBlock.
+covers one BVH node; _Points is set per-node via MaterialPropertyBlock.
 
 _Points is a StructuredBuffer<uint3> (12 bytes/point):
   .x = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
-  .y = (octant[3] << 24) | RGB24    — octant in bits 24-26, RGB in bits 0-23
-  .z = uint16_z in bits 0-15        — Z quantized [0,65535]
+  .y = RGB24 in bits 0-23            — bits 24-31 unused/spare
+  .z = uint16_z in bits 0-15         — Z quantized [0,65535], upper 16 bits spare
 */
 
 Shader "StoryLab PointCloud/URP Octree"
@@ -50,13 +50,12 @@ Shader "StoryLab PointCloud/URP Octree"
             // Set per-node via MaterialPropertyBlock.
             // uint3 per point (12 bytes, one cache line):
             //   .x = (uint16_y << 16) | uint16_x  — XY quantized [0,65535] relative to node bounds
-            //   .y = (octant[3] << 24) | RGB24     — octant in bits 24-26, RGB in bits 0-23
-            //   .z = uint16_z in bits 0-15         — Z quantized [0,65535]
+            //   .y = RGB24 in bits 0-23            — bits 24-31 unused/spare
+            //   .z = uint16_z in bits 0-15         — Z quantized [0,65535], upper 16 bits spare
             StructuredBuffer<uint3> _Points;
             float3 _BoundsMin;
             float3 _BoundsSize;
-            int   _ActiveOctantMask; // bitmask: bit o set = draw octant o
-            float _LodScale;         // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
+            float _LodScale; // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
 
             // Square/circle: axis-aligned quad. Corner order TL, BL, BR, TR.
             static const float2 _CornerOffset[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
@@ -95,19 +94,8 @@ Shader "StoryLab PointCloud/URP Octree"
 
             v2f vert(a2v input)
             {
-                // Fetch and octant-cull before initialising output registers — reduces register
-                // pressure on tile GPUs (Quest) where most vertices are culled by the mask.
                 uint3 pt     = _Points[input.vertexID / 4];
-                uint  octant = (pt.y >> 24) & 0x7u;
-                if ((_ActiveOctantMask & (1u << octant)) == 0u)
-                {
-                    v2f o;
-                    ZERO_INITIALIZE(v2f, o);
-                    UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
-                    return o; // SV_POSITION = (0,0,0,0) → degenerate, clipped for free
-                }
-
-                uint corner = input.vertexID % 4;
+                uint  corner = input.vertexID % 4;
             #if _POINTSHAPE_DIAMOND
                 float2 offset = _DiamondOffset[corner];
             #else
@@ -120,7 +108,7 @@ Shader "StoryLab PointCloud/URP Octree"
                     (pt.x >> 16)     * (1.0 / 65535.0),
                     (pt.z & 0xFFFFu) * (1.0 / 65535.0));
 
-                // Unpack RGB from bits 0-23 of pt.y (alpha is gone — size driven by _ScreenExtent).
+                // Unpack RGB from bits 0-23 of pt.y (bits 24-31 unused; alpha dropped at build time).
                 half3 color = half3(
                      pt.y        & 0xFFu,
                     (pt.y >>  8) & 0xFFu,

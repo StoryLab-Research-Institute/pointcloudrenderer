@@ -10,7 +10,7 @@ using UnityEditor;
 namespace StoryLabResearch.PointCloud
 {
     [ExecuteAlways]
-    public class OctreeRenderer : MonoBehaviour
+    public class PointCloudRenderer : MonoBehaviour
     {
         public enum EPlatformOverride { Auto, Quality, Performance }
 
@@ -41,7 +41,6 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Multiplier on the render properties MinDrawErrorFraction.")]
         public float MinDrawErrorMultiplier = 1f;
 
-        // Resolves the active tier based on the override setting and runtime platform.
         private EPlatformTier ActiveTier
         {
             get
@@ -54,11 +53,10 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private OctreeAsset ActiveAsset   => _assets.Resolve(ActiveTier);
-        private Material    ActiveMaterial => _materials.Resolve(ActiveTier);
+        private BVHAsset  ActiveAsset    => _assets.Resolve(ActiveTier);
+        private Material  ActiveMaterial => _materials.Resolve(ActiveTier);
 
 #if UNITY_EDITOR
-        // Called by PlyImporter to wire up assets and materials on the prefab.
         public void SetImportedAsset(PerPlatformAssets assets, PerPlatformMaterials materials,
             PerPlatformRenderProperties renderProperties = default)
         {
@@ -67,7 +65,6 @@ namespace StoryLabResearch.PointCloud
             SharedRenderProperties = renderProperties;
         }
 
-        // Build processor access — get/set the full struct and restore individual slots.
         public PerPlatformRenderProperties SharedRenderPropertiesForBuild
         {
             get => SharedRenderProperties;
@@ -98,7 +95,7 @@ namespace StoryLabResearch.PointCloud
             };
         }
 
-        public void RestoreQualityAsset(OctreeAsset asset)
+        public void RestoreQualityAsset(BVHAsset asset)
         {
             _assets = new PerPlatformAssets
             {
@@ -107,7 +104,7 @@ namespace StoryLabResearch.PointCloud
             };
         }
 
-        public void RestorePerformanceAsset(OctreeAsset asset)
+        public void RestorePerformanceAsset(BVHAsset asset)
         {
             _assets = new PerPlatformAssets
             {
@@ -119,10 +116,8 @@ namespace StoryLabResearch.PointCloud
 
         private PointCloudRenderProperties ActiveProperties => SharedRenderProperties.Resolve(ActiveTier);
 
-        // Exposed for editor gizmos (e.g. GazeControllerPrototype) — returns null if no SO assigned.
         public PointCloudRenderProperties GetActivePropertiesForGizmo() => ActiveProperties;
 
-        // Fallback values used when no render properties SO is assigned.
         private const int   DefaultPointBudget          = 2_000_000;
         private const float DefaultScreenErrorThreshold = 0.2f;
         private const float DefaultMinDrawErrorFraction = 0.1f;
@@ -135,13 +130,13 @@ namespace StoryLabResearch.PointCloud
                                                     * ScreenErrorMultiplier;
         private float P_MinDrawErrorFraction => (ActiveProperties?.MinDrawErrorFraction ?? DefaultMinDrawErrorFraction)
                                                     * MinDrawErrorMultiplier;
-        private float P_PointSizeScale       => (ActiveProperties?.PointSizeScale     ?? DefaultPointSizeScale)
+        private float P_PointSizeScale       => (ActiveProperties?.PointSizeScale ?? DefaultPointSizeScale)
                                                     * PointSizeMultiplier;
+
         // Fovea position in normalised viewport space. Defaults to screen centre.
-        // Assign from an external gaze controller to drive foveated LOD from gaze input.
         [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
 
-        // Diagnostics — updated each frame, readable from editor scripts or on-screen debug UI.
+        // Diagnostics — updated each frame.
         [NonSerialized] public int LastFramePointsDrawn;
         [NonSerialized] public int LastFramePointsFoveationSaved;
 
@@ -149,11 +144,10 @@ namespace StoryLabResearch.PointCloud
         private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
         private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 32f;
         private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.2f;
+        private float P_LodHysteresis        => ActiveProperties?.LodHysteresis           ?? 0.2f;
 
-
-        private static readonly int PropActiveOctantMask = Shader.PropertyToID("_ActiveOctantMask");
-        private static readonly int PropLodScale         = Shader.PropertyToID("_LodScale");
-        private static readonly int PropPointSize        = Shader.PropertyToID("_PointSize");
+        private static readonly int PropLodScale  = Shader.PropertyToID("_LodScale");
+        private static readonly int PropPointSize = Shader.PropertyToID("_PointSize");
 
         [Tooltip("Gizmo colour for this renderer. Leave alpha=0 to generate a random colour on first use.")]
         [SerializeField] private Color _gizmoColor = Color.clear;
@@ -168,39 +162,37 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        // CullingGroup state — rebuilt whenever the asset or camera changes.
-        private CullingGroup      _cullingGroup;
-        private OctreeNode[]      _cullingNodes;   // parallel to _cullingSpheres
-        private BoundingSphere[]  _cullingSpheres;
-        private int[]             _cullingResults; // reused buffer for QueryIndices
-        private Camera            _cullingCamera;  // camera the group is currently bound to
-        private Matrix4x4         _lastLocalToWorld;
-        private readonly HashSet<OctreeNode> _occludedNodes = new();
+        // CullingGroup state.
+        private CullingGroup     _cullingGroup;
+        private BVHNode[]        _cullingNodes;
+        private BoundingSphere[] _cullingSpheres;
+        private int[]            _cullingResults;
+        private Camera           _cullingCamera;
+        private Matrix4x4        _lastLocalToWorld;
+        private readonly HashSet<BVHNode> _occludedNodes = new HashSet<BVHNode>();
 
         private readonly List<NodeDrawable> _activeDrawables  = new();
         private readonly List<NodeDrawable> _pendingDrawables = new();
 
-        // Max-heap on HeapError — highest error (largest, most visible) node is popped first.
         private readonly List<QueueEntry> _heap = new();
 
-        private readonly Dictionary<OctreeNode, float> _selectedNodes = new();
+        // _selectedNodes is this frame's selection. _prevSelectedNodes carries last frame's
+        // selection forward so the traversal can apply a hysteresis dead-band: nodes that were
+        // selected last frame stay selected until their error drops below the collapse threshold,
+        // preventing LOD toggling at boundaries.
+        private Dictionary<BVHNode, float> _selectedNodes     = new Dictionary<BVHNode, float>();
+        private Dictionary<BVHNode, float> _prevSelectedNodes = new Dictionary<BVHNode, float>();
 
-        // Reused per-frame allocations.
         private readonly Plane[] _frustumPlanes = new Plane[6];
 
-        // Inline AABB-vs-frustum test — avoids a managed→native roundtrip per node.
-        // Each plane is (normal.xyz, distance) where the plane equation is dot(normal, p) + d >= 0 for inside.
-        // We test the positive vertex (the AABB corner most aligned with the plane normal) — if that's outside,
-        // the whole box is outside.
         private static bool TestAABBFrustum(Bounds b, Plane[] planes)
         {
             float minX = b.min.x, minY = b.min.y, minZ = b.min.z;
             float maxX = b.max.x, maxY = b.max.y, maxZ = b.max.z;
             for (int i = 0; i < 6; i++)
             {
-                var n = planes[i].normal;
+                var   n = planes[i].normal;
                 float d = planes[i].distance;
-                // Positive vertex: pick the corner most in the direction of the plane normal.
                 float px = n.x >= 0f ? maxX : minX;
                 float py = n.y >= 0f ? maxY : minY;
                 float pz = n.z >= 0f ? maxZ : minZ;
@@ -209,7 +201,6 @@ namespace StoryLabResearch.PointCloud
             return true;
         }
 
-        // NodeDrawable pool to avoid per-frame GC alloc.
         private readonly List<NodeDrawable> _drawablePool = new();
         private int _poolCursor;
 
@@ -279,22 +270,20 @@ namespace StoryLabResearch.PointCloud
 
         // ----- Occlusion culling (CullingGroup) -----
 
-        private void RefreshCullingGroup(Camera cam, OctreeAsset asset)
+        private void RefreshCullingGroup(Camera cam, BVHAsset asset)
         {
             var localToWorld = transform.localToWorldMatrix;
 
-            // Rebuild if asset changed, camera changed, or group not yet created.
             bool needRebuild = _cullingGroup == null
                 || _cullingCamera != cam
-                || _cullingNodes == null
+                || _cullingNodes  == null
                 || _cullingNodes.Length == 0;
 
             if (needRebuild)
             {
                 DisposeCullingGroup();
 
-                // Collect every node in the tree into a flat list.
-                var nodes = new List<OctreeNode>();
+                var nodes = new List<BVHNode>();
                 CollectNodes(asset.Root, nodes);
 
                 _cullingNodes   = nodes.ToArray();
@@ -304,9 +293,9 @@ namespace StoryLabResearch.PointCloud
                 _cullingGroup.targetCamera = cam;
                 _cullingGroup.SetBoundingSpheres(_cullingSpheres);
                 _cullingGroup.SetBoundingSphereCount(_cullingSpheres.Length);
-                _cullingResults = new int[_cullingSpheres.Length];
-                _cullingCamera  = cam;
-                _lastLocalToWorld = Matrix4x4.zero; // force sphere recompute below
+                _cullingResults   = new int[_cullingSpheres.Length];
+                _cullingCamera    = cam;
+                _lastLocalToWorld = Matrix4x4.zero;
             }
 
             if (localToWorld != _lastLocalToWorld)
@@ -320,13 +309,8 @@ namespace StoryLabResearch.PointCloud
                 _lastLocalToWorld = localToWorld;
             }
 
-            // Keep the distance reference point current — required for occlusion to activate.
             _cullingGroup.SetDistanceReferencePoint(cam.transform.position);
 
-            // Query which spheres are not visible (failed frustum OR occlusion).
-            // Frustum culling is already handled in HeapPush, so double-culling is harmless.
-            // Note: occlusion culling is only active in player builds — in the editor only
-            // frustum culling is applied by CullingGroup.
             _occludedNodes.Clear();
             int hiddenCount = _cullingGroup.QueryIndices(false, _cullingResults, 0);
             for (int i = 0; i < hiddenCount; i++)
@@ -345,226 +329,191 @@ namespace StoryLabResearch.PointCloud
             _occludedNodes.Clear();
         }
 
-        private static void CollectNodes(OctreeNode root, List<OctreeNode> result)
+        private static void CollectNodes(BVHNode root, List<BVHNode> result)
         {
             if (root == null) return;
-            var stack = new Stack<OctreeNode>();
+            var stack = new Stack<BVHNode>();
             stack.Push(root);
             while (stack.Count > 0)
             {
                 var node = stack.Pop();
                 result.Add(node);
-                if (node.Children == null) continue;
-                for (int o = 0; o < 8; o++)
-                    if (node.Children[o] != null) stack.Push(node.Children[o]);
+                if (node.Left  != null) stack.Push(node.Left);
+                if (node.Right != null) stack.Push(node.Right);
             }
         }
 
-        private void SelectNodes(Camera cam, OctreeAsset asset)
+        private void SelectNodes(Camera cam, BVHAsset asset)
         {
-            var   localToWorld  = transform.localToWorldMatrix;
-            float halfFovTan    = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
-            var   camPos        = cam.transform.position;
+            var   localToWorld = transform.localToWorldMatrix;
+            float halfFovTan   = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            var   camPos       = cam.transform.position;
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
 
-            // Cache properties — each P_ accessor resolves ActiveProperties via a property chain.
-            bool  fovEnabled  = P_FoveationEnabled;
-            float fovStrength = P_FoveationStrength;
-            float fovInner    = P_FoveationInnerRadius;
-            float errorThreshold = P_ScreenErrorThreshold;
-            float minDrawFrac    = P_MinDrawErrorFraction;
-            bool  occlusionCull  = P_OcclusionCulling;
-
-            // Cache the VP matrix for manual WorldToViewport transform — avoids a Unity
-            // interop call (cam.WorldToViewportPoint) on every node in the foveation path.
+            bool  fovEnabled      = P_FoveationEnabled;
+            float fovStrength     = P_FoveationStrength;
+            float fovInner        = P_FoveationInnerRadius;
+            float errorThreshold  = P_ScreenErrorThreshold;
+            float minDrawFrac     = P_MinDrawErrorFraction;
+            bool  occlusionCull   = P_OcclusionCulling;
             var vpMatrix = cam.projectionMatrix * cam.worldToCameraMatrix;
 
-            // _LodScale = _PointSize * lodScale * 0.5 — the projection factors are applied
-            // per-eye in the shader using UNITY_MATRIX_P, so the CPU only supplies the scale.
-            var mat = ActiveMaterial;
+            var   mat          = ActiveMaterial;
             float pointSizeBase = mat.GetFloat(PropPointSize) * P_PointSizeScale * 0.5f;
 
-            // Max-heap: enqueue nodes sorted by screen error (largest first).
-            // Pop nodes one at a time; if within budget and above error threshold, expand children.
-            // Otherwise, mark node as selected (frontier).
             _heap.Clear();
             _selectedNodes.Clear();
             HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull);
 
-            int remaining       = P_PointBudget;
-            int foveationSaved  = 0;
+            int remaining      = P_PointBudget;
+            int foveationSaved = 0;
+
             while (_heap.Count > 0)
             {
                 var entry = HeapPop();
+                var node  = entry.Node;
 
-                var node = entry.Node;
                 if (!node.IsLoaded)
                 {
-                    // Fall back to the nearest loaded ancestor so there's no visible hole.
                     if (entry.Parent != null && entry.Parent.IsLoaded)
                         _selectedNodes[entry.Parent] = entry.ScreenError;
                     continue;
                 }
 
                 // Foveation: raise the error threshold for peripheral nodes.
-                // t=0 (fovea) → multiplier=1 (no change). t=1 (periphery) → multiplier=fovStrength.
-                // Large nearby nodes have error >> threshold even after scaling, so they expand
-                // naturally. Distant or peripheral nodes hit the raised threshold sooner and stop,
-                // freeing budget for foveal nodes to expand deeper.
+                // t=0 (fovea) → no change. t=1 (periphery) → full fovStrength multiplier.
+                // Nodes overlapping the inner zone are never penalised.
                 float effectiveThreshold = errorThreshold;
-                bool  hardCapped         = false;
                 if (fovEnabled)
                 {
-                    float t = FoveationT(vpMatrix, fovInner, entry.WorldBounds, camPos, entry.ScreenError, halfFovTan);
+                    float t = FoveationT(vpMatrix, fovInner, entry.WorldBounds, entry.ScreenError, halfFovTan);
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
-                bool wouldExpandWithoutFov = entry.ScreenError >= errorThreshold && !node.IsLeaf && remaining > 0;
-                bool tooSmall = entry.ScreenError < effectiveThreshold;
+                // Hysteresis: nodes selected last frame use a lower collapse threshold —
+                // the same foveation-scaled effective threshold, reduced by the hysteresis factor.
+                float activeThreshold = _prevSelectedNodes.ContainsKey(node)
+                    ? effectiveThreshold * (1f - P_LodHysteresis)
+                    : effectiveThreshold;
+                bool tooSmall = entry.ScreenError < activeThreshold;
 
                 if (!tooSmall && !node.IsLeaf && remaining > 0)
                 {
-                    for (int o = 0; o < 8; o++)
-                    {
-                        if (node.Children[o] != null)
-                            HeapPush(node.Children[o], node, camPos, halfFovTan, localToWorld, occlusionCull);
-                    }
+                    // Track whether foveation is what stopped expansion (for diagnostics).
+                    bool wouldExpandWithoutFov = fovEnabled && entry.ScreenError >= errorThreshold;
+
+                    if (node.Left  != null) HeapPush(node.Left,  node, camPos, halfFovTan, localToWorld, occlusionCull);
+                    if (node.Right != null) HeapPush(node.Right, node, camPos, halfFovTan, localToWorld, occlusionCull);
                     continue;
                 }
 
-                // Select this node. If it exceeds the remaining budget we select it anyway
-                // to avoid holes — a small overshoot on the last node is preferable to
-                // silently dropping visible geometry. The heap is ordered by screen error
-                // so the most visible nodes are always selected first.
                 _selectedNodes[node] = entry.ScreenError;
-                remaining -= node.TotalPointCount;
+                remaining -= node.PointCount;
 
-                // If foveation stopped expansion that would otherwise have continued,
-                // count this node's points as saved by foveation.
-                if (fovEnabled && wouldExpandWithoutFov && tooSmall)
-                    foveationSaved += node.TotalPointCount;
+                if (fovEnabled && entry.ScreenError >= errorThreshold && tooSmall)
+                    foveationSaved += node.PointCount;
             }
 
-            // Emit one draw call per selected node.
+            // Emit draw calls.
             LastFramePointsDrawn = 0;
-            float minDrawError = errorThreshold * minDrawFrac;
+            float minDrawError   = errorThreshold * minDrawFrac;
+
             foreach (var kvp in _selectedNodes)
             {
-                var node          = kvp.Key;
+                var   node        = kvp.Key;
                 float screenError = kvp.Value;
 
-                if (node.TotalPointCount == 0) continue;
-
-                // Skip nodes too small to contribute visibly — reduces overdraw from tiny distant nodes.
+                if (node.PointCount == 0) continue;
                 if (minDrawFrac > 0 && screenError < minDrawError) continue;
 
-                // Build active octant bitmask: skip octants whose child is also selected.
-                int activeMask = 0;
-                int totalKept  = 0;
-                int totalOrig  = 0;
-                for (int o = 0; o < 8; o++)
-                {
-                    if (node.OctantPointCounts[o] == 0) continue;
-                    bool childSelected = !node.IsLeaf
-                        && node.Children[o] != null
-                        && _selectedNodes.ContainsKey(node.Children[o]);
-                    if (!childSelected)
-                    {
-                        activeMask |= (1 << o);
-                        totalKept  += node.OctantPointCounts[o];
-                        totalOrig  += node.OctantOriginalCounts[o];
-                    }
-                }
+                // A BVH node draws its own points unless both children are already selected —
+                // in that case the children cover the space completely and the parent is skipped.
+                bool leftSelected  = node.Left  != null && _selectedNodes.ContainsKey(node.Left);
+                bool rightSelected = node.Right != null && _selectedNodes.ContainsKey(node.Right);
+                if (leftSelected && rightSelected) continue;
 
-                if (activeMask == 0) continue;
-
-                // sqrt(ratio) converts point-count ratio to linear size ratio (area ∝ size²).
-                float ratio    = totalOrig > 0 ? (float)totalOrig / totalKept : 1f;
+                float ratio    = node.OriginalCount > 0 ? (float)node.OriginalCount / node.PointCount : 1f;
                 float lodScale = Mathf.Sqrt(ratio) * pointSizeBase;
 
-                _pendingDrawables.Add(GetDrawable(node, mat, localToWorld, activeMask, totalKept, lodScale));
-                LastFramePointsDrawn += totalKept;
+                _pendingDrawables.Add(GetDrawable(node, mat, localToWorld, node.PointCount, lodScale));
+                LastFramePointsDrawn += node.PointCount;
             }
 
             LastFramePointsFoveationSaved = foveationSaved;
+
+            // Swap selected-node dicts: this frame becomes the hysteresis reference for next frame.
+            var tmp = _prevSelectedNodes;
+            _prevSelectedNodes = _selectedNodes;
+            _selectedNodes = tmp;
         }
 
         // ----- Foveation helpers -----
 
-        // Returns t in [0,1]: 0 = fully inside foveal zone (no cap), 1 = fully peripheral (full cap).
-        // Uses Chebyshev distance in viewport space — naturally rectangular, wider than tall in pixels.
-        // Returns 0 if the node is foveal (no penalty), 1 if peripheral (full strength applied).
-        // Uses a hard step at fovInner — inside is always protected, outside always penalised.
-        // Node screen-space radius is subtracted from the distance so nodes whose extent
-        // overlaps the inner zone are protected even if their centre is outside it.
-        // The subtraction is clamped to fovInner minimum so peripheral large nodes are
-        // still penalised — the radius can only pull r down to the inner boundary.
+        // Returns t in [0,1]: 0 = inside foveal zone (no penalty), 1 = peripheral (full penalty).
+        // Uses Chebyshev distance in viewport space. Nodes whose projected extent overlaps the
+        // inner zone are protected even if their centre lies outside it.
         private float FoveationT(Matrix4x4 vpMatrix, float fovInner,
-            Bounds worldBounds, Vector3 camPos, float screenError, float halfFovTan)
+            Bounds worldBounds, float screenError, float halfFovTan)
         {
-            var c = worldBounds.center;
-            var h = vpMatrix * new Vector4(c.x, c.y, c.z, 1f);
-            if (h.w <= 0f) return 0f; // centre behind camera — straddles camera, never penalise
+            var  c = worldBounds.center;
+            var  h = vpMatrix * new Vector4(c.x, c.y, c.z, 1f);
+            if (h.w <= 0f) return 0f; // centre behind camera — never penalise
             float invW = 1f / h.w;
             float vpx  = h.x * invW * 0.5f + 0.5f;
             float vpy  = h.y * invW * 0.5f + 0.5f;
-            float dx         = Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x);
-            float dy         = Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y);
-            float r          = Mathf.Max(dx, dy);
+            float dx   = Mathf.Abs(Mathf.Clamp(vpx, 0f, 1f) - FoveationCentre.x);
+            float dy   = Mathf.Abs(Mathf.Clamp(vpy, 0f, 1f) - FoveationCentre.y);
+            float r    = Mathf.Max(dx, dy);
+            // Subtract the node's projected half-extent so nodes straddling the boundary are protected.
             float nodeRadius = screenError * halfFovTan * 0.5f;
-            // Peripheral if even accounting for the node's projected extent it doesn't
-            // reach the inner zone. Large boundary nodes with big nodeRadius but centres
-            // far from the fovea still get t=1 because r >> nodeRadius + fovInner.
             return (r - nodeRadius) > fovInner ? 1f : 0f;
         }
 
-        // ----- Heap push/pop (max-heap on raw ScreenError) -----
+        // ----- Heap push/pop (max-heap on ScreenError) -----
 
-        private void HeapPush(OctreeNode node, OctreeNode parent, Vector3 camPos, float halfFovTan, Matrix4x4 localToWorld, bool occlusionCull)
+        private void HeapPush(BVHNode node, BVHNode parent, Vector3 camPos, float halfFovTan,
+            Matrix4x4 localToWorld, bool occlusionCull)
         {
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
             if (!TestAABBFrustum(worldBounds, _frustumPlanes)) return;
             if (occlusionCull && _occludedNodes.Contains(node)) return;
 
-            // Distance to nearest point on the AABB, so nodes the camera is inside or
-            // behind don't get an inflated screen error and consume the entire point budget.
             var closest = new Vector3(
                 Mathf.Clamp(camPos.x, worldBounds.min.x, worldBounds.max.x),
                 Mathf.Clamp(camPos.y, worldBounds.min.y, worldBounds.max.y),
                 Mathf.Clamp(camPos.z, worldBounds.min.z, worldBounds.max.z));
-            float sqrDist  = (camPos - closest).sqrMagnitude;
-            // Combine both sqrts: sqrt(extents.sqrMagnitude / sqrDist) = extents.magnitude / dist.
-            float rawError = sqrDist > 0.000001f
-                ? Mathf.Sqrt(worldBounds.extents.sqrMagnitude / sqrDist) / halfFovTan
+            float sqrDist     = (camPos - closest).sqrMagnitude;
+            var   ext         = worldBounds.extents;
+            float maxExtent   = Mathf.Max(ext.x, Mathf.Max(ext.y, ext.z));
+            float rawError    = sqrDist > 0.000001f
+                ? maxExtent / (Mathf.Sqrt(sqrDist) * halfFovTan)
                 : float.MaxValue;
 
             var entry = new QueueEntry(node, parent, rawError, worldBounds);
             _heap.Add(entry);
-            // Sift up on ScreenError.
             int i = _heap.Count - 1;
             while (i > 0)
             {
-                int parent_ = (i - 1) >> 1;
-                if (_heap[parent_].ScreenError >= _heap[i].ScreenError) break;
-                (_heap[i], _heap[parent_]) = (_heap[parent_], _heap[i]);
-                i = parent_;
+                int p = (i - 1) >> 1;
+                if (_heap[p].ScreenError >= _heap[i].ScreenError) break;
+                (_heap[i], _heap[p]) = (_heap[p], _heap[i]);
+                i = p;
             }
         }
 
         private QueueEntry HeapPop()
         {
-            var top = _heap[0];
+            var top  = _heap[0];
             int last = _heap.Count - 1;
             _heap[0] = _heap[last];
             _heap.RemoveAt(last);
-            // Sift down on ScreenError.
-            int i = 0;
+            int i     = 0;
             int count = _heap.Count;
             while (true)
             {
-                int l = (i << 1) + 1;
-                int r = l + 1;
+                int l       = (i << 1) + 1;
+                int r       = l + 1;
                 int largest = i;
                 if (l < count && _heap[l].ScreenError > _heap[largest].ScreenError) largest = l;
                 if (r < count && _heap[r].ScreenError > _heap[largest].ScreenError) largest = r;
@@ -577,8 +526,8 @@ namespace StoryLabResearch.PointCloud
 
         // ----- NodeDrawable pool -----
 
-        private NodeDrawable GetDrawable(OctreeNode node, Material material,
-            Matrix4x4 localToWorld, int activeMask, int vertCount, float lodScale)
+        private NodeDrawable GetDrawable(BVHNode node, Material material,
+            Matrix4x4 localToWorld, int vertCount, float lodScale)
         {
             NodeDrawable d;
             if (_poolCursor < _drawablePool.Count)
@@ -591,7 +540,7 @@ namespace StoryLabResearch.PointCloud
                 _drawablePool.Add(d);
                 _poolCursor++;
             }
-            d.Set(node, material, localToWorld, activeMask, vertCount, lodScale);
+            d.Set(node, material, localToWorld, vertCount, lodScale);
             return d;
         }
 
@@ -619,41 +568,37 @@ namespace StoryLabResearch.PointCloud
 
         private readonly struct QueueEntry
         {
-            public readonly OctreeNode Node;
-            public readonly OctreeNode Parent;  // fallback if Node isn't loaded yet
-            public readonly float ScreenError;  // raw geometric error, used for heap ordering and LOD size scale
-            public readonly Bounds WorldBounds; // cached to avoid recomputing on pop
-            public QueueEntry(OctreeNode node, OctreeNode parent, float screenError, Bounds worldBounds)
+            public readonly BVHNode Node;
+            public readonly BVHNode Parent;
+            public readonly float   ScreenError;
+            public readonly Bounds  WorldBounds;
+            public QueueEntry(BVHNode node, BVHNode parent, float screenError, Bounds worldBounds)
             {
                 Node = node; Parent = parent; ScreenError = screenError; WorldBounds = worldBounds;
             }
         }
 
-        // Mutable class so it can be pooled and reused across frames.
         private sealed class NodeDrawable : IPointCloudDrawable
         {
-            private OctreeNode _node;
-            private Material   _material;
-            private Matrix4x4  _localToWorld;
-            private int        _activeMask;
-            private int        _vertCount;  // totalKept * 4 (Quads)
-            private float      _lodScale;   // _PointSize * sqrt(orig/kept) * 0.5 — projection applied per-eye in shader
+            private BVHNode   _node;
+            private Material  _material;
+            private Matrix4x4 _localToWorld;
+            private int       _vertCount;
+            private float     _lodScale;
 
-            public void Set(OctreeNode node, Material material,
-                Matrix4x4 localToWorld, int activeMask, int vertCount, float lodScale)
+            public void Set(BVHNode node, Material material,
+                Matrix4x4 localToWorld, int vertCount, float lodScale)
             {
                 _node         = node;
                 _material     = material;
                 _localToWorld = localToWorld;
-                _activeMask   = activeMask;
-                _vertCount    = vertCount * 4;
+                _vertCount    = vertCount * 4; // 4 vertices per point quad
                 _lodScale     = lodScale;
             }
 
             public void Draw(RasterCommandBuffer cmd)
             {
                 var block = _node.PropertyBlock;
-                block.SetInt(PropActiveOctantMask, _activeMask);
                 block.SetFloat(PropLodScale, _lodScale);
                 cmd.DrawProcedural(_localToWorld, _material, 0,
                     MeshTopology.Quads, _vertCount, 1, block);

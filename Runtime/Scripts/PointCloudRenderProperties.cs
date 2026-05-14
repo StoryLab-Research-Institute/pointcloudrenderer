@@ -7,8 +7,8 @@ namespace StoryLabResearch.PointCloud
         menuName = "Point Cloud/Render Properties")]
     public class PointCloudRenderProperties : ScriptableObject
     {
-        [Tooltip("Controls LOD traversal depth. Higher values expand the octree further before stopping, " +
-                 "increasing detail and triangle count. Actual triangles rendered will exceed this value — " +
+        [Tooltip("Controls LOD traversal depth. Higher values expand the BVH further before stopping, " +
+                 "increasing detail and point count. Actual points rendered will exceed this value — " +
                  "tune alongside ScreenErrorThreshold to hit your target frame budget on target hardware.")]
         public int PointBudget = 2_000_000;
 
@@ -42,6 +42,13 @@ namespace StoryLabResearch.PointCloud
                  "0 = effect starts at centre. 0.2 = reasonable protected zone.")]
         [Range(0f, 1f)]
         public float FoveationInnerRadius = 0.2f;
+
+        [Tooltip("LOD hysteresis dead-band. A node selected last frame is kept until its error " +
+                 "falls below ScreenErrorThreshold * (1 - LodHysteresis), requiring a larger " +
+                 "change before collapsing back to the parent. Prevents jitter at LOD boundaries. " +
+                 "0 = disabled. Try 0.15–0.3.")]
+        [Range(0f, 0.5f)]
+        public float LodHysteresis = 0.2f;
 
     }
 }
