@@ -368,9 +368,12 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                // HeapError = ScreenError / foveationScale, so comparing against the base threshold
-                // is equivalent to comparing ScreenError against threshold * foveationScale.
-                bool tooSmall    = entry.HeapError < P_ScreenErrorThreshold;
+                // Per-node threshold: foveal nodes use the base threshold (expand as far as error
+                // allows), peripheral nodes use a raised threshold (stop expanding sooner).
+                // Budget freed by early peripheral stopping is naturally available for foveal expansion.
+                var worldBounds = TransformBounds(node.Bounds, localToWorld);
+                float fovMult   = FoveationThresholdMultiplier(worldBounds.center, entry.ScreenError, cam, halfFovTan);
+                bool tooSmall    = entry.ScreenError < P_ScreenErrorThreshold * fovMult;
                 bool outOfBudget = remaining <= 0;
 
                 if (tooSmall || outOfBudget || node.IsLeaf)
@@ -392,7 +395,7 @@ namespace StoryLabResearch.PointCloud
             float minDrawError = P_ScreenErrorThreshold * P_MinDrawErrorFraction;
             foreach (var kvp in _selectedNodes)
             {
-                var node       = kvp.Key;
+                var node          = kvp.Key;
                 float screenError = kvp.Value;
 
                 if (node.TotalPointCount == 0) continue;
@@ -428,13 +431,15 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        // ----- Foveation scale -----
+        // ----- Foveation threshold multiplier -----
 
-        // Returns (FoveationStrength+1)^t where t is the node's normalised peripheral position [0,1].
-        // Dividing rawError by this gives heapError: peripheral nodes are deprioritised exponentially,
-        // so doubling strength compounds rather than adding. t uses the bounds-extent correction so a
-        // large node covering screen centre isn't penalised because its centre projects off-axis.
-        private float FoveationScale(Vector3 worldCenter, float rawError, Camera cam, float halfFovTan)
+        // Returns a value >= 1 representing how much to raise the stopping threshold for this node.
+        // t=0 (fovea): multiplier=1 — threshold unchanged, node expands as far as error allows.
+        // t=1 (periphery): multiplier=(FoveationStrength+1) — threshold raised, expansion stops sooner.
+        // Applied to the per-node stopping test in SelectNodes, not to heap ordering, so the error
+        // metric governs selection order purely on geometric grounds. Budget redistributes naturally:
+        // peripheral nodes stop earlier, freeing budget for foveal nodes to expand deeper.
+        private float FoveationThresholdMultiplier(Vector3 worldCenter, float rawError, Camera cam, float halfFovTan)
         {
             if (!P_FoveationEnabled || P_FoveationStrength <= 0f) return 1f;
             var vp = cam.WorldToViewportPoint(worldCenter);
@@ -454,7 +459,7 @@ namespace StoryLabResearch.PointCloud
             return Mathf.Pow(P_FoveationStrength + 1f, t);
         }
 
-        // ----- Heap push/pop (max-heap on foveation-adjusted ScreenError) -----
+        // ----- Heap push/pop (max-heap on raw ScreenError) -----
 
         private void HeapPush(OctreeNode node, OctreeNode parent, Camera cam, float halfFovTan, Matrix4x4 localToWorld)
         {
@@ -475,19 +480,14 @@ namespace StoryLabResearch.PointCloud
                 ? worldBounds.extents.magnitude / dist / halfFovTan
                 : float.MaxValue;
 
-            // heapError = rawError / (strength+1)^t — exponential peripheral penalty so
-            // budget runs out in screen-position order, not just distance order.
-            float fovScale   = FoveationScale(worldBounds.center, rawError, cam, halfFovTan);
-            float heapError  = rawError / fovScale;
-
-            var entry = new QueueEntry(node, parent, rawError, heapError);
+            var entry = new QueueEntry(node, parent, rawError);
             _heap.Add(entry);
-            // Sift up on HeapError.
+            // Sift up on ScreenError.
             int i = _heap.Count - 1;
             while (i > 0)
             {
                 int parent_ = (i - 1) >> 1;
-                if (_heap[parent_].HeapError >= _heap[i].HeapError) break;
+                if (_heap[parent_].ScreenError >= _heap[i].ScreenError) break;
                 (_heap[i], _heap[parent_]) = (_heap[parent_], _heap[i]);
                 i = parent_;
             }
@@ -499,7 +499,7 @@ namespace StoryLabResearch.PointCloud
             int last = _heap.Count - 1;
             _heap[0] = _heap[last];
             _heap.RemoveAt(last);
-            // Sift down on HeapError.
+            // Sift down on ScreenError.
             int i = 0;
             int count = _heap.Count;
             while (true)
@@ -507,8 +507,8 @@ namespace StoryLabResearch.PointCloud
                 int l = (i << 1) + 1;
                 int r = l + 1;
                 int largest = i;
-                if (l < count && _heap[l].HeapError > _heap[largest].HeapError) largest = l;
-                if (r < count && _heap[r].HeapError > _heap[largest].HeapError) largest = r;
+                if (l < count && _heap[l].ScreenError > _heap[largest].ScreenError) largest = l;
+                if (r < count && _heap[r].ScreenError > _heap[largest].ScreenError) largest = r;
                 if (largest == i) break;
                 (_heap[i], _heap[largest]) = (_heap[largest], _heap[i]);
                 i = largest;
@@ -562,11 +562,10 @@ namespace StoryLabResearch.PointCloud
         {
             public readonly OctreeNode Node;
             public readonly OctreeNode Parent;  // fallback if Node isn't loaded yet
-            public readonly float ScreenError;  // raw geometric error, used for LOD size scale
-            public readonly float HeapError;    // ScreenError / foveationScale, used for heap ordering and stop test
-            public QueueEntry(OctreeNode node, OctreeNode parent, float screenError, float heapError)
+            public readonly float ScreenError;  // raw geometric error, used for heap ordering and LOD size scale
+            public QueueEntry(OctreeNode node, OctreeNode parent, float screenError)
             {
-                Node = node; Parent = parent; ScreenError = screenError; HeapError = heapError;
+                Node = node; Parent = parent; ScreenError = screenError;
             }
         }
 
