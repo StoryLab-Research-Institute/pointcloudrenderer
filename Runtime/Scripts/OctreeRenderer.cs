@@ -150,6 +150,7 @@ namespace StoryLabResearch.PointCloud
         private BoundingSphere[]  _cullingSpheres;
         private int[]             _cullingResults; // reused buffer for QueryIndices
         private Camera            _cullingCamera;  // camera the group is currently bound to
+        private Matrix4x4         _lastLocalToWorld;
         private readonly HashSet<OctreeNode> _occludedNodes = new();
 
         private readonly List<NodeDrawable> _activeDrawables  = new();
@@ -235,6 +236,8 @@ namespace StoryLabResearch.PointCloud
 
         private void RefreshCullingGroup(Camera cam, OctreeAsset asset)
         {
+            var localToWorld = transform.localToWorldMatrix;
+
             // Rebuild if asset changed, camera changed, or group not yet created.
             bool needRebuild = _cullingGroup == null
                 || _cullingCamera != cam
@@ -252,19 +255,24 @@ namespace StoryLabResearch.PointCloud
                 _cullingNodes   = nodes.ToArray();
                 _cullingSpheres = new BoundingSphere[_cullingNodes.Length];
 
-                var localToWorld = transform.localToWorldMatrix;
-                for (int i = 0; i < _cullingNodes.Length; i++)
-                {
-                    var wb = TransformBounds(_cullingNodes[i].Bounds, localToWorld);
-                    _cullingSpheres[i] = new BoundingSphere(wb.center, wb.extents.magnitude);
-                }
-
                 _cullingGroup = new CullingGroup();
                 _cullingGroup.targetCamera = cam;
                 _cullingGroup.SetBoundingSpheres(_cullingSpheres);
                 _cullingGroup.SetBoundingSphereCount(_cullingSpheres.Length);
                 _cullingResults = new int[_cullingSpheres.Length];
-                _cullingCamera = cam;
+                _cullingCamera  = cam;
+                _lastLocalToWorld = Matrix4x4.zero; // force sphere recompute below
+            }
+
+            if (localToWorld != _lastLocalToWorld)
+            {
+                for (int i = 0; i < _cullingNodes.Length; i++)
+                {
+                    var wb = TransformBounds(_cullingNodes[i].Bounds, localToWorld);
+                    _cullingSpheres[i] = new BoundingSphere(wb.center, wb.extents.magnitude);
+                }
+                _cullingGroup.SetBoundingSpheres(_cullingSpheres);
+                _lastLocalToWorld = localToWorld;
             }
 
             // Keep the distance reference point current — required for occlusion to activate.
@@ -283,11 +291,12 @@ namespace StoryLabResearch.PointCloud
         private void DisposeCullingGroup()
         {
             _cullingGroup?.Dispose();
-            _cullingGroup   = null;
-            _cullingCamera  = null;
-            _cullingNodes   = null;
-            _cullingSpheres = null;
-            _cullingResults = null;
+            _cullingGroup     = null;
+            _cullingCamera    = null;
+            _cullingNodes     = null;
+            _cullingSpheres   = null;
+            _cullingResults   = null;
+            _lastLocalToWorld = Matrix4x4.zero;
             _occludedNodes.Clear();
         }
 
