@@ -176,12 +176,12 @@ namespace StoryLabResearch.PointCloud
 
         private readonly List<QueueEntry> _heap = new();
 
-        // _selectedNodes is this frame's selection. _prevSelectedNodes carries last frame's
-        // selection forward so the traversal can apply a hysteresis dead-band: nodes that were
-        // selected last frame stay selected until their error drops below the collapse threshold,
-        // preventing LOD toggling at boundaries.
-        private Dictionary<BVHNode, float> _selectedNodes     = new Dictionary<BVHNode, float>();
-        private Dictionary<BVHNode, float> _prevSelectedNodes = new Dictionary<BVHNode, float>();
+        private readonly Dictionary<BVHNode, float> _selectedNodes = new Dictionary<BVHNode, float>();
+        // Nodes expanded last frame (children pushed, node itself not drawn).
+        // Used for hysteresis: an expanded node stays expanded until error drops below
+        // threshold * (1 - hysteresis), preventing collapse-then-re-expand toggling.
+        private HashSet<BVHNode> _prevExpandedNodes = new HashSet<BVHNode>();
+        private HashSet<BVHNode> _expandedNodes     = new HashSet<BVHNode>();
 
         private readonly Plane[] _frustumPlanes = new Plane[6];
 
@@ -363,6 +363,7 @@ namespace StoryLabResearch.PointCloud
 
             _heap.Clear();
             _selectedNodes.Clear();
+            _expandedNodes.Clear();
             HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull);
 
             int remaining      = P_PointBudget;
@@ -390,18 +391,18 @@ namespace StoryLabResearch.PointCloud
                     effectiveThreshold *= Mathf.Lerp(1f, fovStrength, t);
                 }
 
-                // Hysteresis: nodes selected last frame use a lower collapse threshold —
-                // the same foveation-scaled effective threshold, reduced by the hysteresis factor.
-                float activeThreshold = _prevSelectedNodes.ContainsKey(node)
+                // Hysteresis: a node that was expanded last frame uses a lower collapse threshold,
+                // requiring a larger drop in error before it stops expanding. This stabilises the
+                // LOD boundary — expansion is always eager, collapse requires a dead-band drop.
+                bool wasExpanded = _prevExpandedNodes.Contains(node);
+                float activeThreshold = wasExpanded
                     ? effectiveThreshold * (1f - P_LodHysteresis)
                     : effectiveThreshold;
                 bool tooSmall = entry.ScreenError < activeThreshold;
 
                 if (!tooSmall && !node.IsLeaf && remaining > 0)
                 {
-                    // Track whether foveation is what stopped expansion (for diagnostics).
-                    bool wouldExpandWithoutFov = fovEnabled && entry.ScreenError >= errorThreshold;
-
+                    _expandedNodes.Add(node);
                     if (node.Left  != null) HeapPush(node.Left,  node, camPos, halfFovTan, localToWorld, occlusionCull);
                     if (node.Right != null) HeapPush(node.Right, node, camPos, halfFovTan, localToWorld, occlusionCull);
                     continue;
@@ -441,10 +442,10 @@ namespace StoryLabResearch.PointCloud
 
             LastFramePointsFoveationSaved = foveationSaved;
 
-            // Swap selected-node dicts: this frame becomes the hysteresis reference for next frame.
-            var tmp = _prevSelectedNodes;
-            _prevSelectedNodes = _selectedNodes;
-            _selectedNodes = tmp;
+            // Swap expanded-node sets: this frame's expansions become next frame's hysteresis reference.
+            var tmp = _prevExpandedNodes;
+            _prevExpandedNodes = _expandedNodes;
+            _expandedNodes = tmp;
         }
 
         // ----- Foveation helpers -----
