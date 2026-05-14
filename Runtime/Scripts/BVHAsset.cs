@@ -121,14 +121,11 @@ namespace StoryLabResearch.PointCloud
                     GlobalBufferOffset  = nodeOffset,
                 };
 
-                // PropertyBlock carries per-node uniforms: bounds and offset into the global buffer.
-                // _Points is bound once on the material; the shader uses _PointOffset to find this node's data.
                 node.GlobalBufferOffset = nodeOffset;
-                var bn = meta.Bounds;
-                node.PropertyBlock = new MaterialPropertyBlock();
-                node.PropertyBlock.SetVector("_BoundsMin",   new Vector4(bn.min.x,  bn.min.y,  bn.min.z,  0));
-                node.PropertyBlock.SetVector("_BoundsSize",  new Vector4(bn.size.x, bn.size.y, bn.size.z, 0));
-                node.PropertyBlock.SetInt("_PointOffset", nodeOffset);
+                node.LodScaleBase = meta.PointCount > 0 && meta.OriginalCount > meta.PointCount
+                    ? Mathf.Sqrt((float)meta.OriginalCount / meta.PointCount)
+                    : 1f;
+                node.IsLoaded = meta.PointCount > 0;
             }
 
             _loaded = true;

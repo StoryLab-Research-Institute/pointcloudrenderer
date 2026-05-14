@@ -184,13 +184,17 @@ namespace StoryLabResearch.PointCloud
         private readonly Plane[] _frustumPlanes = new Plane[6];
 
         // Indirect draw state.
-        // NodeDescriptor layout (32 bytes = 8 floats):
-        //   [0] boundsMin.x, [1] boundsMin.y, [2] boundsMin.z, [3] pointOffset (as float bits)
-        //   [4] boundsSize.x, [5] boundsSize.y, [6] boundsSize.z, [7] pointCount (as float bits)
-        private GraphicsBuffer _nodeDescriptorBuffer; // StructuredBuffer<NodeDescriptor> on GPU
+        // NodeDescriptor layout (48 bytes = 3 float4s):
+        //   float4 a: boundsMin.xyz, lodScale
+        //   float4 b: boundsSize.xyz, <pad>
+        //   uint4  c: pointOffset, pointCount, 0, 0  (reinterpreted as float bits)
+        private GraphicsBuffer _nodeDescriptorBuffer; // StructuredBuffer<float4> on GPU (validCount*3 elements)
         private GraphicsBuffer _indirectArgsBuffer;   // args for DrawProceduralIndirect
-        private float[]        _nodeDescriptorData;   // CPU-side staging, resized as needed
-        private uint[]         _indirectArgsData;     // CPU-side staging: [vertexCount, instanceCount, 0, 0]
+        private float[]        _nodeDescriptorData;   // CPU-side staging array
+        private uint[]         _indirectArgsData;     // [vertexCount, instanceCount, startVertex, startInstance]
+        private int            _descriptorCapacity;   // allocated node capacity of _nodeDescriptorBuffer
+        private bool           _globalBufferBound;    // whether GlobalPointBuffer is bound to the material
+        private bool           _descriptorBufferBound;// whether _nodeDescriptorBuffer is bound to the material
         private IndirectDrawable _indirectDrawable;   // single registered drawable
 
         private static bool TestAABBFrustum(Bounds b, Plane[] planes)
@@ -250,6 +254,8 @@ namespace StoryLabResearch.PointCloud
                 DisposeCullingGroup();
                 DisposeIndirectBuffers();
                 _selectedIndices.Clear();
+                _globalBufferBound    = false;
+                _descriptorBufferBound = false;
                 _lastActiveAsset = asset;
             }
 
@@ -399,8 +405,11 @@ namespace StoryLabResearch.PointCloud
             var   mat           = ActiveMaterial;
             float pointSizeBase = P_PointSizeScale * 0.5f;
 
-            if (asset.GlobalPointBuffer != null)
+            if (!_globalBufferBound && asset.GlobalPointBuffer != null)
+            {
                 mat.SetBuffer(PropPoints, asset.GlobalPointBuffer);
+                _globalBufferBound = true;
+            }
 
             // Reset per-frame selection state — only touch indices written last frame.
             foreach (int idx in _selectedIndices)
@@ -464,58 +473,37 @@ namespace StoryLabResearch.PointCloud
 
             // Build indirect draw — one instanced call covering all selected nodes.
             // NodeDescriptor layout in _nodeDescriptorBuffer (48 bytes = 3 float4s):
-            //   float4 a: boundsMin.xyz,  lodScale
-            //   float4 b: boundsSize.xyz, <unused/pad>
-            //   uint4  c: pointOffset, pointCount, 0, 0
+            //   float4 a: boundsMin.xyz, lodScale
+            //   float4 b: boundsSize.xyz, <pad>
+            //   uint4  c: pointOffset, pointCount, 0, 0  (reinterpreted as float bits)
             LastFramePointsDrawn = 0;
             float minDrawError   = errorThreshold * minDrawFrac;
+            int   selectedCount  = _selectedIndices.Count;
 
-            // First pass: count valid nodes and find max point count (vertex count per instance).
-            int validCount    = 0;
-            int maxPointCount = 0;
-            foreach (int idx in _selectedIndices)
+            // Ensure GPU descriptor buffer has capacity for worst-case (all selected nodes valid).
+            // Grows with 50% headroom; never shrinks to avoid thrashing.
+            if (selectedCount > _descriptorCapacity)
             {
-                var   node        = _cullingNodes[idx];
-                float screenError = _selectedError[idx];
-                if (node.PointCount == 0) continue;
-                if (minDrawFrac > 0f && screenError < minDrawError) continue;
-                bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
-                bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
-                if (leftSelected && rightSelected) continue;
-                validCount++;
-                if (node.PointCount > maxPointCount) maxPointCount = node.PointCount;
-            }
-
-            if (validCount == 0)
-            {
-                DeregisterIndirect();
-                (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
-                return;
-            }
-
-            // Ensure GPU buffers are large enough (grow only, never shrink).
-            // Each descriptor is 48 bytes = 12 floats.
-            int descriptorFloats = validCount * 12;
-            if (_nodeDescriptorData == null || _nodeDescriptorData.Length < descriptorFloats)
-            {
+                int newCapacity = selectedCount + selectedCount / 2;
                 _nodeDescriptorBuffer?.Release();
-                // 3 float4s per node (48 bytes), stored as validCount*3 float4 elements (stride 16).
-                _nodeDescriptorBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, validCount * 3, 16);
-                _nodeDescriptorData   = new float[descriptorFloats];
+                _nodeDescriptorBuffer  = new GraphicsBuffer(GraphicsBuffer.Target.Structured, newCapacity * 3, 16);
+                _nodeDescriptorData    = new float[newCapacity * 12];
+                _descriptorCapacity    = newCapacity;
+                _descriptorBufferBound = false;
             }
             if (_indirectArgsBuffer == null)
             {
-                // 4 uints: vertexCount, instanceCount, startVertex, startInstance.
-                _indirectArgsBuffer = new GraphicsBuffer(
-                    GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint));
-                _indirectArgsData = new uint[4];
+                _indirectArgsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint));
+                _indirectArgsData   = new uint[4];
             }
 
-            // Second pass: fill descriptor CPU array.
-            int di = 0;
-            foreach (int idx in _selectedIndices)
+            // Single pass: fill descriptor array, tracking valid count and max point count inline.
+            int  validCount    = 0;
+            int  maxPointCount = 0;
+            for (int s = 0; s < selectedCount; s++)
             {
-                var   node        = _cullingNodes[idx];
+                int   idx        = _selectedIndices[s];
+                var   node       = _cullingNodes[idx];
                 float screenError = _selectedError[idx];
                 if (node.PointCount == 0) continue;
                 if (minDrawFrac > 0f && screenError < minDrawError) continue;
@@ -523,10 +511,11 @@ namespace StoryLabResearch.PointCloud
                 bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
                 if (leftSelected && rightSelected) continue;
 
-                float ratio    = node.OriginalCount > 0 ? (float)node.OriginalCount / node.PointCount : 1f;
-                float lodScale = Mathf.Sqrt(ratio) * pointSizeBase;
+                if (node.PointCount > maxPointCount) maxPointCount = node.PointCount;
+
+                float lodScale = node.LodScaleBase * pointSizeBase;
                 var   bn       = node.Bounds;
-                int   o        = di * 12;
+                int   o        = validCount * 12;
 
                 // float4 a
                 _nodeDescriptorData[o + 0] = bn.min.x;
@@ -538,26 +527,35 @@ namespace StoryLabResearch.PointCloud
                 _nodeDescriptorData[o + 5] = bn.size.y;
                 _nodeDescriptorData[o + 6] = bn.size.z;
                 _nodeDescriptorData[o + 7] = 0f;
-                // uint4 c — reinterpret int bits into the float array using BitConverter
+                // uint4 c — reinterpret int bits into the float array
                 _nodeDescriptorData[o +  8] = BitConverter.Int32BitsToSingle(node.GlobalBufferOffset);
                 _nodeDescriptorData[o +  9] = BitConverter.Int32BitsToSingle(node.PointCount);
                 _nodeDescriptorData[o + 10] = 0f;
                 _nodeDescriptorData[o + 11] = 0f;
 
-                di++;
+                validCount++;
                 LastFramePointsDrawn += node.PointCount;
             }
 
-            // Upload descriptors (validCount * 3 float4s = validCount * 12 floats) and indirect args.
+            if (validCount == 0)
+            {
+                DeregisterIndirect();
+                (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
+                return;
+            }
+
             _nodeDescriptorBuffer.SetData(_nodeDescriptorData, 0, 0, validCount * 12);
-            _indirectArgsData[0] = (uint)(maxPointCount * 6); // vertexCount: 6 verts per point (2 triangles)
-            _indirectArgsData[1] = (uint)validCount;          // instanceCount: one per node
+            _indirectArgsData[0] = (uint)(maxPointCount * 6); // 6 verts per point (2 triangles)
+            _indirectArgsData[1] = (uint)validCount;
             _indirectArgsData[2] = 0;
             _indirectArgsData[3] = 0;
             _indirectArgsBuffer.SetData(_indirectArgsData);
 
-            // Bind buffers to material.
-            mat.SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer);
+            if (!_descriptorBufferBound)
+            {
+                mat.SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer);
+                _descriptorBufferBound = true;
+            }
 
             if (_indirectDrawable == null)
             {
@@ -660,11 +658,13 @@ namespace StoryLabResearch.PointCloud
         private void DisposeIndirectBuffers()
         {
             _nodeDescriptorBuffer?.Release();
-            _nodeDescriptorBuffer = null;
+            _nodeDescriptorBuffer  = null;
             _indirectArgsBuffer?.Release();
-            _indirectArgsBuffer   = null;
-            _nodeDescriptorData   = null;
-            _indirectArgsData     = null;
+            _indirectArgsBuffer    = null;
+            _nodeDescriptorData    = null;
+            _indirectArgsData      = null;
+            _descriptorCapacity    = 0;
+            _descriptorBufferBound = false;
         }
 
         // ----- Utilities -----
