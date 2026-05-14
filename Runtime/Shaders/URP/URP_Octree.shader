@@ -58,8 +58,11 @@ Shader "StoryLab PointCloud/URP Octree"
             int   _ActiveOctantMask; // bitmask: bit o set = draw octant o
             float _LodScale;         // _PointSize * lodScale * 0.5 — extent multiplied by P._m00/11 in shader
 
-            // Quad: 4 verts in order TL, BL, BR, TR — matches MeshTopology.Quads winding.
-            static const float2 _CornerUV[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
+            // Square/circle: axis-aligned quad. Corner order TL, BL, BR, TR.
+            static const float2 _CornerOffset[4] = { float2(-1,1), float2(-1,-1), float2(1,-1), float2(1,1) };
+            // Diamond: rotated 45° — corners at cardinal points (top, left, bottom, right).
+            // Geometry IS the diamond shape; no fragment clip required.
+            static const float2 _DiamondOffset[4] = { float2(0,1), float2(-1,0), float2(0,-1), float2(1,0) };
 
             struct a2v
             {
@@ -70,9 +73,12 @@ Shader "StoryLab PointCloud/URP Octree"
             {
                 float4 clipPos : SV_POSITION;
                 half3  color   : COLOR;
-                half2  uv      : TEXCOORD0;
 
                 UNITY_VERTEX_OUTPUT_STEREO
+
+            #if _POINTSHAPE_CIRCLE
+                half2  uv      : TEXCOORD0;
+            #endif
 
             #if !_COLORMODE_SOLID
             #if FOG_LINEAR || FOG_EXP || FOG_EXP2
@@ -101,11 +107,12 @@ Shader "StoryLab PointCloud/URP Octree"
                     return o; // SV_POSITION = (0,0,0,0) → degenerate, clipped for free
                 }
 
-                v2f o;
-                ZERO_INITIALIZE(v2f, o);
-                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
-
-                float2 uv = _CornerUV[input.vertexID % 4];
+                uint corner = input.vertexID % 4;
+            #if _POINTSHAPE_DIAMOND
+                float2 offset = _DiamondOffset[corner];
+            #else
+                float2 offset = _CornerOffset[corner];
+            #endif
 
                 // Dequantize position from uint16 unorm to world space.
                 float3 pos = _BoundsMin + _BoundsSize * float3(
@@ -133,11 +140,16 @@ Shader "StoryLab PointCloud/URP Octree"
                 float minExtent = 2.0 / _ScreenParams.y;
                 screenExtent = max(screenExtent, minExtent);
 
-                clipPos.xy += uv * screenExtent;
+                clipPos.xy += offset * screenExtent;
 
+                v2f o;
+                ZERO_INITIALIZE(v2f, o);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
                 o.clipPos = clipPos;
-                o.color   = color; // half3 RGB, no alpha
-                o.uv      = uv;
+                o.color   = color;
+            #if _POINTSHAPE_CIRCLE
+                o.uv = offset;
+            #endif
 
             #if !_COLORMODE_SOLID
             #if FOG_LINEAR || FOG_EXP || FOG_EXP2
@@ -148,19 +160,11 @@ Shader "StoryLab PointCloud/URP Octree"
                 return o;
             }
 
-            void ClipToShape(half2 uv)
-            {
-            #if _POINTSHAPE_DIAMOND
-                clip(1.0 - abs(uv.x) - abs(uv.y));
-            #elif _POINTSHAPE_CIRCLE
-                clip(1.0 - length(uv));
-            #endif
-                // _POINTSHAPE_SQUARE: full quad, no clip
-            }
-
             half4 frag(v2f i) : SV_TARGET
             {
-                ClipToShape(i.uv);
+            #if _POINTSHAPE_CIRCLE
+                clip(1.0 - length(i.uv));
+            #endif
 
                 #if _COLORMODE_SOLID
                     return _Color;
@@ -185,7 +189,9 @@ Shader "StoryLab PointCloud/URP Octree"
 
             half4 depthFrag(v2f i) : SV_TARGET
             {
-                ClipToShape(i.uv);
+            #if _POINTSHAPE_CIRCLE
+                clip(1.0 - length(i.uv));
+            #endif
                 return 0;
             }
 

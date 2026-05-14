@@ -185,6 +185,27 @@ namespace StoryLabResearch.PointCloud
         // Reused per-frame allocations.
         private readonly Plane[] _frustumPlanes = new Plane[6];
 
+        // Inline AABB-vs-frustum test — avoids a managed→native roundtrip per node.
+        // Each plane is (normal.xyz, distance) where the plane equation is dot(normal, p) + d >= 0 for inside.
+        // We test the positive vertex (the AABB corner most aligned with the plane normal) — if that's outside,
+        // the whole box is outside.
+        private static bool TestAABBFrustum(Bounds b, Plane[] planes)
+        {
+            float minX = b.min.x, minY = b.min.y, minZ = b.min.z;
+            float maxX = b.max.x, maxY = b.max.y, maxZ = b.max.z;
+            for (int i = 0; i < 6; i++)
+            {
+                var n = planes[i].normal;
+                float d = planes[i].distance;
+                // Positive vertex: pick the corner most in the direction of the plane normal.
+                float px = n.x >= 0f ? maxX : minX;
+                float py = n.y >= 0f ? maxY : minY;
+                float pz = n.z >= 0f ? maxZ : minZ;
+                if (n.x * px + n.y * py + n.z * pz + d < 0f) return false;
+            }
+            return true;
+        }
+
         // NodeDrawable pool to avoid per-frame GC alloc.
         private readonly List<NodeDrawable> _drawablePool = new();
         private int _poolCursor;
@@ -493,7 +514,7 @@ namespace StoryLabResearch.PointCloud
         {
             if (node == null) return;
             var worldBounds = TransformBounds(node.Bounds, localToWorld);
-            if (!GeometryUtility.TestPlanesAABB(_frustumPlanes, worldBounds)) return;
+            if (!TestAABBFrustum(worldBounds, _frustumPlanes)) return;
             if (occlusionCull && _occludedNodes.Contains(node)) return;
 
             // Distance to nearest point on the AABB, so nodes the camera is inside or
