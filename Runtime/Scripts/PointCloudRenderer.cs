@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
+using UnityEngine.XR;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -545,7 +546,12 @@ namespace StoryLabResearch.PointCloud
 
             _nodeDescriptorBuffer.SetData(_nodeDescriptorData, 0, 0, validCount * 12);
             _indirectArgsData[0] = (uint)(maxPointCount * 6); // 6 verts per point (2 triangles)
-            _indirectArgsData[1] = (uint)validCount;
+            // Under single-pass instanced stereo, Unity cannot auto-double the instance count for
+            // indirect draws (the args buffer is opaque to it). We double manually so SV_InstanceID
+            // covers [0, validCount*2), letting UNITY_SETUP_INSTANCE_ID decode eye (bit 0) and
+            // node index (>> 1) correctly.
+            bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
+            _indirectArgsData[1] = (uint)(stereoInstanced ? validCount * 2 : validCount);
             _indirectArgsData[2] = 0;
             _indirectArgsData[3] = 0;
             _indirectArgsBuffer.SetData(_indirectArgsData);

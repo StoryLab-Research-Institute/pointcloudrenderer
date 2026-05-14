@@ -73,7 +73,7 @@ Shader "StoryLab PointCloud/URP Octree"
             struct a2v
             {
                 uint vertexID   : SV_VertexID;
-                uint instanceID : SV_InstanceID;
+                uint instanceID : SV_InstanceID; // always present; UNITY_SETUP_INSTANCE_ID decodes eye+node under stereo
             };
 
             struct v2f
@@ -102,8 +102,21 @@ Shader "StoryLab PointCloud/URP Octree"
 
             v2f vert(a2v input)
             {
+                UNITY_SETUP_INSTANCE_ID(input);         // sets unity_InstanceID and unity_StereoEyeIndex
+
                 // Look up this instance's node descriptor (3 consecutive float4s).
-                uint base3      = input.instanceID * 3u;
+                // Under single-pass instanced stereo, Unity packs [nodeIndex*2 + eyeIndex] into
+                // SV_InstanceID; UNITY_SETUP_INSTANCE_ID extracts the real node index into
+                // unity_InstanceID via >> 1. When instancing is disabled, fall back to raw SV_InstanceID.
+                // Under stereo instancing, UNITY_SETUP_INSTANCE_ID has decoded input.instanceID into
+                // unity_InstanceID (stripping the eye bit). Use that when available; otherwise
+                // input.instanceID is already the plain node index.
+                #if UNITY_ANY_INSTANCING_ENABLED
+                uint nodeIndex = unity_InstanceID;
+                #else
+                uint nodeIndex = input.instanceID;
+                #endif
+                uint base3      = nodeIndex * 3u;
                 float4 descA    = _NodeDescriptors[base3 + 0u]; // boundsMin.xyz, lodScale
                 float4 descB    = _NodeDescriptors[base3 + 1u]; // boundsSize.xyz, <pad>
                 float4 descC    = _NodeDescriptors[base3 + 2u]; // pointOffset, pointCount (as uint bits)
@@ -180,6 +193,7 @@ Shader "StoryLab PointCloud/URP Octree"
 
             half4 frag(v2f i) : SV_TARGET
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
             #if _POINTSHAPE_CIRCLE
                 clip(1.0 - length(i.uv));
             #endif
@@ -207,6 +221,7 @@ Shader "StoryLab PointCloud/URP Octree"
 
             half4 depthFrag(v2f i) : SV_TARGET
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
             #if _POINTSHAPE_CIRCLE
                 clip(1.0 - length(i.uv));
             #endif
@@ -230,6 +245,7 @@ Shader "StoryLab PointCloud/URP Octree"
                 #pragma target 4.5
                 #pragma multi_compile_fog
                 #pragma multi_compile _ UNITY_COLORSPACE_GAMMA
+                #pragma multi_compile_instancing
                 #pragma shader_feature _COLORMODE_VERTEX _COLORMODE_SOLID _COLORMODE_BLEND
                 #pragma shader_feature _POINTSHAPE_DIAMOND _POINTSHAPE_CIRCLE _POINTSHAPE_SQUARE
                 #pragma vertex vert
@@ -251,6 +267,7 @@ Shader "StoryLab PointCloud/URP Octree"
             HLSLPROGRAM
                 #pragma target 4.5
                 #pragma multi_compile _ UNITY_COLORSPACE_GAMMA
+                #pragma multi_compile_instancing
                 #pragma shader_feature _POINTSHAPE_DIAMOND _POINTSHAPE_CIRCLE _POINTSHAPE_SQUARE
                 #pragma vertex vert
                 #pragma fragment depthFrag
