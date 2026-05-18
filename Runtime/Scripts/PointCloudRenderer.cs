@@ -204,7 +204,7 @@ namespace StoryLabResearch.PointCloud
         private uint[]         _indirectArgsData;     // [vertexCount, instanceCount, startVertex, startInstance]
         private readonly int[] _descriptorCapacity    = new int[2];
         private int            _bufferIndex;          // toggles 0/1 each frame
-        private bool           _globalBufferBound;    // whether GlobalPointBuffer is bound to the material
+        private GraphicsBuffer _lastBoundPointBuffer; // the GlobalPointBuffer instance currently bound to the material
         private IndirectDrawable _indirectDrawable;   // single registered drawable
 
         private static bool TestAABBFrustum(float minX, float minY, float minZ,
@@ -263,9 +263,8 @@ namespace StoryLabResearch.PointCloud
             {
                 DisposeCullingGroup();
                 DisposeIndirectBuffers();
-                _selectedCount     = 0;
-                _globalBufferBound = false;
-                _lastActiveAsset   = asset;
+                _selectedCount   = 0;
+                _lastActiveAsset = asset;
             }
 
             if (P_OcclusionCulling)
@@ -447,10 +446,10 @@ namespace StoryLabResearch.PointCloud
             var   mat           = ActiveMaterial;
             float pointSizeBase = P_PointSizeScale * 0.5f;
 
-            if (!_globalBufferBound && asset.GlobalPointBuffer != null)
+            if (asset.GlobalPointBuffer != null && asset.GlobalPointBuffer != _lastBoundPointBuffer)
             {
                 mat.SetBuffer(PropPoints, asset.GlobalPointBuffer);
-                _globalBufferBound = true;
+                _lastBoundPointBuffer = asset.GlobalPointBuffer;
             }
 
             // Reset per-frame selection state — only touch indices written last frame.
@@ -792,9 +791,10 @@ namespace StoryLabResearch.PointCloud
                 _indirectArgsBuffer[i]   = null;
                 _descriptorCapacity[i]   = 0;
             }
-            _nodeDescriptorData = null;
-            _indirectArgsData   = null;
-            _bufferIndex        = 0;
+            _nodeDescriptorData   = null;
+            _indirectArgsData     = null;
+            _bufferIndex          = 0;
+            _lastBoundPointBuffer = null;
         }
 
         // ----- Utilities -----
