@@ -4,7 +4,6 @@ using UnityEngine.Rendering;
 
 namespace StoryLabResearch.PointCloud
 {
-    [CreateAssetMenu(fileName = "BVHAsset", menuName = "StoryLab PointCloud/BVH Asset")]
     public class BVHAsset : ScriptableObject
     {
         [Serializable]

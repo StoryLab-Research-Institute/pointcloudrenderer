@@ -4,7 +4,7 @@ namespace StoryLabResearch.PointCloud
 {
     [CreateAssetMenu(
         fileName = "PointCloudRenderProperties",
-        menuName = "Point Cloud/Render Properties")]
+        menuName = "StoryLab Point Cloud/Render Properties")]
     public class PointCloudRenderProperties : ScriptableObject
     {
         [Tooltip("Controls LOD traversal depth. Higher values expand the BVH further before stopping, " +

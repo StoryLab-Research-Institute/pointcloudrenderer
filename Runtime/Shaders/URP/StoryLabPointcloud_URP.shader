@@ -7,7 +7,7 @@ Replaces the geometry shader approach with StructuredBuffer + vertex shader,
 which runs identically on Android (Quest 3+) and desktop — no geometry shader
 required, no fallback path needed.
 
-Points are driven via DrawProcedural from OctreeRenderer. Each draw call
+Points are driven via DrawProcedural from PointCloudRenderer. Each draw call
 covers one BVH node; _Points is set per-node via MaterialPropertyBlock.
 
 _Points is a StructuredBuffer<uint3> (12 bytes/point):
@@ -16,7 +16,7 @@ _Points is a StructuredBuffer<uint3> (12 bytes/point):
   .z = uint16_z in bits 0-15         — Z quantized [0,65535], upper 16 bits spare
 */
 
-Shader "StoryLab PointCloud/URP Octree"
+Shader "StoryLab Point Cloud/StoryLabPointcloud_URP"
 {
     Properties
     {

@@ -10,7 +10,7 @@ namespace StoryLabResearch.PointCloud
     [ScriptedImporter(7, "ply")]
     class PlyImporter : ScriptedImporter
     {
-        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.octree/runtime/shaders/";
+        public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.v2/runtime/shaders/";
 
         public enum EAxisPreset
         {
@@ -111,7 +111,7 @@ namespace StoryLabResearch.PointCloud
         private Material ResolveMaterial(AssetImportContext context,
             PlatformImportTier tier, string assetName, string subAssetKey)
         {
-            var sourceMat = tier.Material != null ? tier.Material : GetDefaultOctreeMaterial();
+            var sourceMat = tier.Material != null ? tier.Material : GetDefaultMaterial();
 
             switch (tier.MaterialMode)
             {
@@ -221,12 +221,12 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        static Material GetDefaultOctreeMaterial()
+        static Material GetDefaultMaterial()
         {
-            var path = SHADER_PATH + "URP/DefaultOctreePointCloud.mat";
+            var path = SHADER_PATH + "URP/DefaultStoryLabPointcloud.mat";
             var mat = AssetDatabase.LoadAssetAtPath<Material>(path);
             if (mat == null)
-                throw new Exception($"Could not find default octree material at '{path}'.");
+                throw new Exception($"Could not find default material at '{path}'.");
             return mat;
         }
 

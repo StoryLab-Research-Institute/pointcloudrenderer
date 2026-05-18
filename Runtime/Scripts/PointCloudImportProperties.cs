@@ -78,7 +78,7 @@ namespace StoryLabResearch.PointCloud
 
     [CreateAssetMenu(
         fileName = "PointCloudImportProperties",
-        menuName = "Point Cloud/Import Properties")]
+        menuName = "StoryLab Point Cloud/Import Properties")]
     public class PointCloudImportProperties : ScriptableObject
     {
         public enum EMaterialMode { Shared, Instantiated, Extracted }
