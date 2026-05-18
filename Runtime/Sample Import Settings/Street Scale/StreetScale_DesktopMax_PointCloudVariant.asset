@@ -1,0 +1,29 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 59b823ada5c354946ba14999dbfcb4b2, type: 3}
+  m_Name: DesktopMax_PointCloudVariant 1
+  m_EditorClassIdentifier: 
+  VariantName: Max
+  Platforms: 1
+  MinPointSpacing: 0
+  MaxNodeSideLength: 1
+  Material: {fileID: 2100000, guid: 959e84d8f72f19042ad0c50a5fc6e6cc, type: 2}
+  MaterialMode: 0
+  PointBudget: 20000000
+  ScreenErrorThreshold: 0.05
+  MinDrawErrorFraction: 0.1
+  PointSizeScale: 0.02
+  OcclusionCullingEnabled: 1
+  FoveationEnabled: 0
+  FoveationStrength: 16
+  FoveationInnerRadius: 0.39
+  LodHysteresis: 0.3

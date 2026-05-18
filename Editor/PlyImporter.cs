@@ -7,29 +7,24 @@ using System.IO;
 
 namespace StoryLabResearch.PointCloud
 {
-    [ScriptedImporter(7, "ply")]
+    [ScriptedImporter(8, "ply")]
     class PlyImporter : ScriptedImporter
     {
         public static readonly string SHADER_PATH = "Packages/com.storylabresearch.pointcloudrenderer.v2/runtime/shaders/";
 
         public enum EAxisPreset
         {
-            // PLY has no axis convention — these presets cover the most common real-world cases.
-            ZUpRightHanded,  // Photogrammetry / LiDAR standard (RealityCapture, Metashape, RiSCAN).
-                             // PLY (x,y,z) → Unity (-x, z, y). Negates X to correct handedness.
             ZUpLeftHanded,   // CloudCompare default export and some other tools.
-                             // PLY (x,y,z) → Unity (x, z, y). No handedness correction.
+            ZUpRightHanded,  // Photogrammetry / LiDAR standard (RealityCapture, Metashape, RiSCAN).
             YUpRightHanded,  // Blender / DCC right-handed Y-up.
-                             // PLY (x,y,z) → Unity (x, y, -z).
             None,            // Pass-through — raw PLY values used as-is.
             Custom,          // Use the AxisX/AxisY/AxisZ fields below.
         }
 
         public enum EAxis { PosX, NegX, PosY, NegY, PosZ, NegZ }
 
-        [Tooltip("Maps PLY axes to Unity world axes. " +
-                 "Most photogrammetry and LiDAR tools export Z-up right-handed.")]
-        public EAxisPreset AxisPreset = EAxisPreset.ZUpRightHanded;
+        [Tooltip("Maps PLY axes to Unity world axes. ")]
+        public EAxisPreset AxisPreset = EAxisPreset.ZUpLeftHanded;
 
         [Tooltip("Which PLY axis (±) maps to Unity +X. Only used when AxisPreset is Custom.")]
         public EAxis AxisX = EAxis.PosX;
@@ -41,23 +36,17 @@ namespace StoryLabResearch.PointCloud
         public float Rescale = 1.0f;
         public bool ApplySRGBCorrection;
 
-        [Tooltip("Optional shared import properties asset. When set, overrides all settings below.")]
+        [Tooltip("Optional shared import properties asset. When set, overrides the variant list below.")]
         public PointCloudImportProperties ImportProperties;
 
-        // Inline settings — used when ImportProperties is null.
-        [Tooltip("Quality tier (PC / Mac / Consoles).")]
-        public PlatformImportTier Quality;
+        [Tooltip("Ordered list of variants to build. Index 0 = highest quality / first priority.")]
+        public PointCloudVariant[] Variants = Array.Empty<PointCloudVariant>();
 
-        [Tooltip("Performance tier (Android / Quest).")]
-        public PlatformImportTier Performance;
-
-        // Resolved accessors — read from ImportProperties if set, else inline fields.
-        private PlatformImportTier R_Quality     => ImportProperties != null ? ImportProperties.Quality     : Quality;
-        private PlatformImportTier R_Performance => ImportProperties != null ? ImportProperties.Performance : Performance;
+        private PointCloudVariant[] ResolvedVariants =>
+            ImportProperties != null ? ImportProperties.Variants : Variants;
 
         public override void OnImportAsset(AssetImportContext context)
         {
-            // Clean up any old sidecar .bin files left in Assets/ by earlier import versions.
             DeleteOldSidecarBins(context.assetPath);
 
             ReadPointData(context.assetPath, out var positions, out var colors);
@@ -65,55 +54,62 @@ namespace StoryLabResearch.PointCloud
 
             ApplyAxisSwizzle(positions);
 
-            var name            = Path.GetFileNameWithoutExtension(context.assetPath);
-            var qualityTier     = R_Quality;
-            var performanceTier = R_Performance;
+            var name     = Path.GetFileNameWithoutExtension(context.assetPath);
+            var variants = ResolvedVariants;
 
-            var qualityAsset = BVHBuilder.BuildFromPointsEmbedded(
-                positions, colors, qualityTier.MinPointSpacing, qualityTier.MaxNodeSideLength);
-            if (qualityAsset == null) return;
+            if (variants == null || variants.Length == 0)
+            {
+                Debug.LogWarning($"[PlyImporter] '{name}' has no variants configured. " +
+                                 "Add at least one PointCloudVariant.");
+                return;
+            }
 
-            var performanceAsset = BVHBuilder.BuildFromPointsEmbedded(
-                positions, colors, performanceTier.MinPointSpacing, performanceTier.MaxNodeSideLength);
-            if (performanceAsset == null) return;
-
-            qualityAsset.name     = name + "_Quality";
-            performanceAsset.name = name + "_Performance";
-
-            // Resolve materials for each tier.
-            var qualityMat     = ResolveMaterial(context, qualityTier,     name + "_Quality",     "material_quality");
-            var performanceMat = ResolveMaterial(context, performanceTier, name + "_Performance", "material_performance");
-
-            // Build the prefab.
-            var go = new GameObject(name);
+            var go       = new GameObject(name);
             var renderer = go.AddComponent<PointCloudRenderer>();
 
-            renderer.SetImportedAsset(
-                new PerPlatformAssets    { Quality = qualityAsset,  Performance = performanceAsset },
-                new PerPlatformMaterials { Quality = qualityMat,    Performance = performanceMat },
-                new PerPlatformRenderProperties
+            var entries = new PointCloudRenderer.VariantEntry[variants.Length];
+            for (int i = 0; i < variants.Length; i++)
+            {
+                var variant = variants[i];
+                if (variant == null)
                 {
-                    Quality     = qualityTier.RenderProperties,
-                    Performance = performanceTier.RenderProperties,
-                });
+                    Debug.LogWarning($"[PlyImporter] '{name}' variant[{i}] is null — skipping.");
+                    continue;
+                }
 
-            context.AddObjectToAsset("bvh_quality",     qualityAsset);
-            context.AddObjectToAsset("bvh_performance", performanceAsset);
+                var asset = BVHBuilder.BuildFromPointsEmbedded(
+                    positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength);
+                if (asset == null) continue;
+
+                var safeName = string.IsNullOrWhiteSpace(variant.VariantName)
+                    ? $"Variant{i}"
+                    : variant.VariantName;
+                asset.name = $"{name}_{safeName}";
+
+                var mat = ResolveMaterial(context, variant, $"{name}_{safeName}", $"material_{i}");
+
+                context.AddObjectToAsset($"bvh_{i}", asset);
+
+                entries[i] = new PointCloudRenderer.VariantEntry
+                {
+                    Variant          = variant,
+                    Asset            = asset,
+                    ResolvedMaterial = mat,
+                };
+            }
+
+            renderer.SetImportedVariants(entries);
+
             context.AddObjectToAsset("prefab", go);
             context.SetMainObject(go);
         }
 
-        // Resolves the material for a tier:
-        //   Shared      — returns the source material directly (no copy).
-        //   Instantiated — embeds a copy as a sub-asset inside the .ply import.
-        //   Extracted   — writes a standalone .mat next to the .ply and returns a reference to it.
-        //                  If the .mat already exists it is reused without overwriting.
         private Material ResolveMaterial(AssetImportContext context,
-            PlatformImportTier tier, string assetName, string subAssetKey)
+            PointCloudVariant variant, string assetName, string subAssetKey)
         {
-            var sourceMat = tier.Material != null ? tier.Material : GetDefaultMaterial();
+            var sourceMat = variant.Material != null ? variant.Material : GetDefaultMaterial();
 
-            switch (tier.MaterialMode)
+            switch (variant.MaterialMode)
             {
                 case PointCloudImportProperties.EMaterialMode.Instantiated:
                 {
@@ -124,9 +120,7 @@ namespace StoryLabResearch.PointCloud
 
                 case PointCloudImportProperties.EMaterialMode.Extracted:
                 {
-                    // Sidecar path: MyCloud_Quality.mat / MyCloud_Performance.mat next to the .ply.
                     var matAssetPath = Path.ChangeExtension(context.assetPath, null) + "_" + assetName + ".mat";
-
                     var existing = AssetDatabase.LoadAssetAtPath<Material>(matAssetPath);
                     if (existing != null)
                     {
@@ -134,10 +128,6 @@ namespace StoryLabResearch.PointCloud
                         return existing;
                     }
 
-                    // Sidecar does not yet exist. AssetDatabase.CreateAsset is forbidden inside a
-                    // ScriptedImporter, so defer the write to after this import completes.
-                    // This import run embeds the material; Unity will re-import automatically when
-                    // the new .mat appears, at which point the extracted file will be used.
                     var copy = new Material(sourceMat) { name = assetName };
                     var capturedPath = matAssetPath;
                     var capturedCopy = copy;
@@ -159,12 +149,11 @@ namespace StoryLabResearch.PointCloud
 
         private void ApplyAxisSwizzle(Vector3[] positions)
         {
-            // Resolve the three signed-axis selectors for the active preset.
             EAxis ax, ay, az;
             switch (AxisPreset)
             {
-                case EAxisPreset.ZUpRightHanded: ax = EAxis.NegX; ay = EAxis.PosZ; az = EAxis.PosY; break;
                 case EAxisPreset.ZUpLeftHanded:  ax = EAxis.PosX; ay = EAxis.PosZ; az = EAxis.PosY; break;
+                case EAxisPreset.ZUpRightHanded: ax = EAxis.NegX; ay = EAxis.PosZ; az = EAxis.PosY; break;
                 case EAxisPreset.YUpRightHanded: ax = EAxis.PosX; ay = EAxis.PosY; az = EAxis.NegZ; break;
                 case EAxisPreset.None:           return;
                 default: /* Custom */            ax = AxisX; ay = AxisY; az = AxisZ; break;
@@ -230,8 +219,6 @@ namespace StoryLabResearch.PointCloud
             return mat;
         }
 
-        // Remove legacy sidecar .bin files that used to live next to the .ply in Assets/.
-        // These are no longer written; bins now live in Library/PointCloudBins/.
         static void DeleteOldSidecarBins(string plyAssetPath)
         {
             var projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
@@ -490,5 +477,4 @@ namespace StoryLabResearch.PointCloud
         }
         #endregion
     }
-
 }

@@ -1,6 +1,7 @@
 using UnityEngine;
-using UnityEditor.AssetImporters;
 using UnityEditor;
+using UnityEditor.AssetImporters;
+using UnityEditorInternal;
 
 namespace StoryLabResearch.PointCloud
 {
@@ -14,11 +15,9 @@ namespace StoryLabResearch.PointCloud
         SerializedProperty _rescale;
         SerializedProperty _applySRGBCorrection;
         SerializedProperty _importProperties;
-        SerializedProperty _quality;
-        SerializedProperty _performance;
+        SerializedProperty _variants;
 
-        bool _qualityFoldout     = true;
-        bool _performanceFoldout = true;
+        ReorderableList _variantList;
 
         public override void OnEnable()
         {
@@ -31,8 +30,30 @@ namespace StoryLabResearch.PointCloud
             _rescale             = serializedObject.FindProperty(nameof(PlyImporter.Rescale));
             _applySRGBCorrection = serializedObject.FindProperty(nameof(PlyImporter.ApplySRGBCorrection));
             _importProperties    = serializedObject.FindProperty(nameof(PlyImporter.ImportProperties));
-            _quality             = serializedObject.FindProperty(nameof(PlyImporter.Quality));
-            _performance         = serializedObject.FindProperty(nameof(PlyImporter.Performance));
+            _variants            = serializedObject.FindProperty(nameof(PlyImporter.Variants));
+
+            _variantList = new ReorderableList(serializedObject, _variants,
+                draggable: true, displayHeader: true,
+                displayAddButton: true, displayRemoveButton: true)
+            {
+                drawHeaderCallback  = rect => EditorGUI.LabelField(rect, "Variants  (index 0 = highest priority)"),
+                drawElementCallback = DrawVariantElement,
+                elementHeight       = EditorGUIUtility.singleLineHeight + 2f,
+            };
+        }
+
+        private void DrawVariantElement(Rect rect, int index, bool isActive, bool isFocused)
+        {
+            var element = _variants.GetArrayElementAtIndex(index);
+            rect.y      += 1f;
+            rect.height  = EditorGUIUtility.singleLineHeight;
+
+            var variant = element.objectReferenceValue as PointCloudVariant;
+            string label = variant != null
+                ? $"[{index}]  {variant.VariantName}  —  {variant.Platforms}"
+                : $"[{index}]  (none)";
+
+            EditorGUI.ObjectField(rect, element, typeof(PointCloudVariant), new GUIContent(label));
         }
 
         public override void OnInspectorGUI()
@@ -52,11 +73,10 @@ namespace StoryLabResearch.PointCloud
             }
             else
             {
-                // Show the resolved mapping as a read-only hint.
                 string mapping = preset switch
                 {
-                    PlyImporter.EAxisPreset.ZUpRightHanded => "Unity (+X, +Y, +Z)  ←  PLY (−X, +Z, +Y)",
                     PlyImporter.EAxisPreset.ZUpLeftHanded  => "Unity (+X, +Y, +Z)  ←  PLY (+X, +Z, +Y)",
+                    PlyImporter.EAxisPreset.ZUpRightHanded => "Unity (+X, +Y, +Z)  ←  PLY (−X, +Z, +Y)",
                     PlyImporter.EAxisPreset.YUpRightHanded => "Unity (+X, +Y, +Z)  ←  PLY (+X, +Y, −Z)",
                     _                                      => "Pass-through — PLY axes used as-is",
                 };
@@ -69,88 +89,28 @@ namespace StoryLabResearch.PointCloud
 
             EditorGUILayout.PropertyField(_importProperties,
                 new GUIContent("Import Properties",
-                    "Optional shared import properties asset. When set, all settings below are ignored."));
+                    "Optional shared import properties asset. When set, the variant list below is ignored."));
 
             if (_importProperties.objectReferenceValue != null)
             {
                 EditorGUILayout.HelpBox(
-                    "Settings are driven by the Import Properties asset above. " +
-                    "Clear it to use per-asset inline settings.",
+                    "Variants are driven by the Import Properties asset above. " +
+                    "Clear it to use the per-asset variant list below.",
                     MessageType.Info);
             }
             else
             {
                 EditorGUILayout.Space();
-                DrawTierSection("Quality  (PC / Mac / Consoles)", _quality, ref _qualityFoldout);
-                EditorGUILayout.Space();
-                DrawTierSection("Performance  (Android / Quest)", _performance, ref _performanceFoldout);
+                _variantList.DoLayoutList();
+
+                if (_variants.arraySize == 0)
+                    EditorGUILayout.HelpBox(
+                        "No variants configured. Add at least one PointCloudVariant to import this asset.",
+                        MessageType.Warning);
             }
 
             serializedObject.ApplyModifiedProperties();
             ApplyRevertGUI();
-        }
-
-        private void DrawTierSection(string label, SerializedProperty tier, ref bool foldout)
-        {
-            foldout = EditorGUILayout.BeginFoldoutHeaderGroup(foldout, label);
-            if (foldout)
-            {
-                EditorGUI.indentLevel++;
-
-                EditorGUILayout.LabelField("Point Processing", EditorStyles.boldLabel);
-                var spacingProp = tier.FindPropertyRelative(nameof(PlatformImportTier.MinPointSpacing));
-                float newSpacing = EditorGUILayout.FloatField(
-                    new GUIContent("Min Point Spacing",
-                        "Cull points closer together than this world-space distance. 0 = disabled."),
-                    spacingProp.floatValue);
-                spacingProp.floatValue = Mathf.Max(0f, newSpacing);
-
-                EditorGUILayout.Space();
-
-                EditorGUILayout.LabelField("Material", EditorStyles.boldLabel);
-                var modeProp = tier.FindPropertyRelative(nameof(PlatformImportTier.MaterialMode));
-                EditorGUILayout.PropertyField(modeProp, new GUIContent("Mode"));
-
-                var matProp = tier.FindPropertyRelative(nameof(PlatformImportTier.Material));
-                var mode = (PointCloudImportProperties.EMaterialMode)modeProp.intValue;
-                switch (mode)
-                {
-                    case PointCloudImportProperties.EMaterialMode.Shared:
-                        EditorGUILayout.PropertyField(matProp,
-                            new GUIContent("Material", "Used directly. Leave empty for the pipeline default."));
-                        EditorGUILayout.HelpBox(
-                            "The material reference is used as-is. Edits affect every cloud sharing it.",
-                            MessageType.None);
-                        break;
-                    case PointCloudImportProperties.EMaterialMode.Instantiated:
-                        EditorGUILayout.PropertyField(matProp,
-                            new GUIContent("Source Material", "Material to copy. Leave empty for the pipeline default."));
-                        EditorGUILayout.HelpBox(
-                            "A copy is embedded inside this asset. Edit it via the sub-asset in the Project window.",
-                            MessageType.None);
-                        break;
-                    case PointCloudImportProperties.EMaterialMode.Extracted:
-                        EditorGUILayout.PropertyField(matProp,
-                            new GUIContent("Source Material", "Material to copy. Leave empty for the pipeline default."));
-                        EditorGUILayout.HelpBox(
-                            "A copy is written as a standalone .mat file next to the .ply. " +
-                            "Assign it as the Shared material on other clouds to reuse it.",
-                            MessageType.None);
-                        break;
-                }
-
-                EditorGUILayout.Space();
-
-                EditorGUILayout.LabelField("Render Properties", EditorStyles.boldLabel);
-                var renderProp = tier.FindPropertyRelative(nameof(PlatformImportTier.RenderProperties));
-                EditorGUILayout.PropertyField(renderProp,
-                    new GUIContent("Render Properties",
-                        "Render settings applied to the imported PointCloudRenderer for this tier. " +
-                        "Leave unset to use PointCloudRenderer built-in defaults."));
-
-                EditorGUI.indentLevel--;
-            }
-            EditorGUILayout.EndFoldoutHeaderGroup();
         }
     }
 }

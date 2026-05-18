@@ -13,21 +13,25 @@ namespace StoryLabResearch.PointCloud
     [ExecuteAlways]
     public class PointCloudRenderer : MonoBehaviour
     {
-        public enum EPlatformOverride { Auto, Quality, Performance }
+        // One entry per variant, parallel to the PointCloudVariant[] on the importer.
+        // The variant SO carries runtime params; the BVHAsset is the built artefact for that variant.
+        [Serializable]
+        public struct VariantEntry
+        {
+            public PointCloudVariant Variant;
+            [HideInInspector] public BVHAsset Asset;
 
-        [SerializeField] private PerPlatformAssets _assets;
-        [SerializeField] private PerPlatformMaterials _materials;
+            [HideInInspector]
+            public Material ResolvedMaterial;
+        }
 
-        [Tooltip("Auto: selects Quality on PC/Mac/consoles, Performance on Android/Quest. " +
-                 "Override to force a specific tier for debugging.")]
-        [SerializeField] private EPlatformOverride PlatformOverride = EPlatformOverride.Auto;
+        [SerializeField] private VariantEntry[] _variants = Array.Empty<VariantEntry>();
 
-        [Tooltip("Per-platform render properties. The correct tier is selected automatically " +
-                 "based on the current platform (or PlatformOverride).")]
-        [SerializeField] private PerPlatformRenderProperties SharedRenderProperties;
-
-        [Tooltip("In edit mode, follow the scene view camera instead of Camera.main.")]
-        [SerializeField] private bool UseSceneCameraInEditMode = true;
+        [Tooltip("Index into the variant list. 0 = first (highest priority) entry. " +
+                 "Set at runtime via SetVariantByIndex / SetVariantByName. " +
+                 "Clamped to the available range if the list is shorter than expected " +
+                 "(e.g. after build stripping).")]
+        [SerializeField] private int _activeVariantIndex;
 
         [Tooltip("Multiplier on the render properties PointBudget.")]
         public float PointBudgetMultiplier = 1f;
@@ -42,97 +46,86 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Multiplier on the render properties MinDrawErrorFraction.")]
         public float MinDrawErrorMultiplier = 1f;
 
-        private EPlatformTier ActiveTier
+        // ----- Variant resolution -----
+
+        private int ClampedVariantIndex =>
+            _variants is not { Length: > 0 } ? -1
+            : Mathf.Clamp(_activeVariantIndex, 0, _variants.Length - 1);
+
+        private VariantEntry? ActiveEntry
         {
             get
             {
-                if (PlatformOverride == EPlatformOverride.Quality)     return EPlatformTier.Quality;
-                if (PlatformOverride == EPlatformOverride.Performance) return EPlatformTier.Performance;
-                return Application.platform == RuntimePlatform.Android
-                    ? EPlatformTier.Performance
-                    : EPlatformTier.Quality;
+                int i = ClampedVariantIndex;
+                return i < 0 ? (VariantEntry?)null : _variants[i];
             }
         }
 
-        private BVHAsset  ActiveAsset    => _assets.Resolve(ActiveTier);
-        private Material  ActiveMaterial => _materials.Resolve(ActiveTier);
+        private BVHAsset           ActiveAsset      => ActiveEntry?.Asset;
+        private Material           ActiveMaterial   => ActiveEntry?.ResolvedMaterial;
+        private PointCloudVariant  ActiveVariant    => ActiveEntry?.Variant;
+
+        // ----- Public API -----
+
+        public int VariantCount => _variants?.Length ?? 0;
+
+        public int ActiveVariantIndex
+        {
+            get => ClampedVariantIndex;
+            set => _activeVariantIndex = value;
+        }
+
+        /// <summary>
+        /// Selects the first variant whose VariantName contains <paramref name="name"/>
+        /// (case-insensitive). Returns true if a match was found.
+        /// </summary>
+        public bool SetVariantByName(string name)
+        {
+            if (_variants == null) return false;
+            for (int i = 0; i < _variants.Length; i++)
+            {
+                if (_variants[i].Variant != null &&
+                    _variants[i].Variant.VariantName.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    _activeVariantIndex = i;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ----- Editor support -----
 
 #if UNITY_EDITOR
-        public void SetImportedAsset(PerPlatformAssets assets, PerPlatformMaterials materials,
-            PerPlatformRenderProperties renderProperties = default)
+        public VariantEntry[] VariantsForBuild
         {
-            _assets                = assets;
-            _materials             = materials;
-            SharedRenderProperties = renderProperties;
+            get => _variants;
+            set => _variants = value;
         }
 
-        public PerPlatformRenderProperties SharedRenderPropertiesForBuild
+        public void SetImportedVariants(VariantEntry[] variants)
         {
-            get => SharedRenderProperties;
-            set => SharedRenderProperties = value;
+            _variants            = variants;
+            _activeVariantIndex  = 0;
         }
 
-        public PerPlatformAssets AssetsForBuild
+        public void RestoreVariantAsset(int index, BVHAsset asset)
         {
-            get => _assets;
-            set => _assets = value;
+            if (_variants == null || index >= _variants.Length) return;
+            _variants[index].Asset = asset;
         }
 
-        public void RestoreQualityRenderProperties(PointCloudRenderProperties so)
+        public void RestoreVariantMaterial(int index, Material material)
         {
-            SharedRenderProperties = new PerPlatformRenderProperties
-            {
-                Quality     = new LazyLoadReference<PointCloudRenderProperties>(so),
-                Performance = SharedRenderProperties.Performance,
-            };
-        }
-
-        public void RestorePerformanceRenderProperties(PointCloudRenderProperties so)
-        {
-            SharedRenderProperties = new PerPlatformRenderProperties
-            {
-                Quality     = SharedRenderProperties.Quality,
-                Performance = new LazyLoadReference<PointCloudRenderProperties>(so),
-            };
-        }
-
-        public void RestoreQualityAsset(BVHAsset asset)
-        {
-            _assets = new PerPlatformAssets
-            {
-                Quality     = asset,
-                Performance = _assets.Performance,
-            };
-        }
-
-        public void RestorePerformanceAsset(BVHAsset asset)
-        {
-            _assets = new PerPlatformAssets
-            {
-                Quality     = _assets.Quality,
-                Performance = asset,
-            };
+            if (_variants == null || index >= _variants.Length) return;
+            _variants[index].ResolvedMaterial = material;
         }
 #endif
 
-        private PointCloudRenderProperties ActiveProperties => SharedRenderProperties.Resolve(ActiveTier);
+        // ----- Diagnostics -----
 
-        public PointCloudRenderProperties GetActivePropertiesForGizmo() => ActiveProperties;
-
-        private const int   DefaultPointBudget          = 2_000_000;
-        private const float DefaultScreenErrorThreshold = 0.2f;
-        private const float DefaultMinDrawErrorFraction = 0.1f;
-        private const float DefaultPointSizeScale       = 0.01f;
-
-        private int   P_PointBudget          => Mathf.Max(1, Mathf.RoundToInt(
-                                                    (ActiveProperties?.PointBudget ?? DefaultPointBudget)
-                                                    * PointBudgetMultiplier));
-        private float P_ScreenErrorThreshold => (ActiveProperties?.ScreenErrorThreshold ?? DefaultScreenErrorThreshold)
-                                                    * ScreenErrorMultiplier;
-        private float P_MinDrawErrorFraction => (ActiveProperties?.MinDrawErrorFraction ?? DefaultMinDrawErrorFraction)
-                                                    * MinDrawErrorMultiplier;
-        private float P_PointSizeScale       => (ActiveProperties?.PointSizeScale ?? DefaultPointSizeScale)
-                                                    * PointSizeMultiplier;
+        [Tooltip("In edit mode, follow the scene view camera instead of Camera.main.")]
+        [SerializeField] private bool UseSceneCameraInEditMode = true;
 
         // Fovea position in normalised viewport space. Defaults to screen centre.
         [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
@@ -140,11 +133,28 @@ namespace StoryLabResearch.PointCloud
         // Diagnostic — updated each frame.
         [NonSerialized] public int LastFramePointsDrawn;
 
-        private bool  P_OcclusionCulling     => ActiveProperties?.OcclusionCullingEnabled ?? true;
-        private bool  P_FoveationEnabled     => ActiveProperties?.FoveationEnabled        ?? false;
-        private float P_FoveationStrength    => ActiveProperties?.FoveationStrength       ?? 32f;
-        private float P_FoveationInnerRadius => ActiveProperties?.FoveationInnerRadius    ?? 0.2f;
-        private float P_LodHysteresis        => ActiveProperties?.LodHysteresis           ?? 0.2f;
+        // ----- Default fallbacks when no variant is assigned -----
+
+        private const int   DefaultPointBudget          = 2_000_000;
+        private const float DefaultScreenErrorThreshold = 0.2f;
+        private const float DefaultMinDrawErrorFraction = 0.1f;
+        private const float DefaultPointSizeScale       = 0.01f;
+
+        private int   P_PointBudget          => Mathf.Max(1, Mathf.RoundToInt(
+                                                    (ActiveVariant?.PointBudget ?? DefaultPointBudget)
+                                                    * PointBudgetMultiplier));
+        private float P_ScreenErrorThreshold => (ActiveVariant?.ScreenErrorThreshold ?? DefaultScreenErrorThreshold)
+                                                    * ScreenErrorMultiplier;
+        private float P_MinDrawErrorFraction => (ActiveVariant?.MinDrawErrorFraction ?? DefaultMinDrawErrorFraction)
+                                                    * MinDrawErrorMultiplier;
+        private float P_PointSizeScale       => (ActiveVariant?.PointSizeScale ?? DefaultPointSizeScale)
+                                                    * PointSizeMultiplier;
+
+        private bool  P_OcclusionCulling     => ActiveVariant?.OcclusionCullingEnabled ?? true;
+        private bool  P_FoveationEnabled     => ActiveVariant?.FoveationEnabled        ?? false;
+        private float P_FoveationStrength    => ActiveVariant?.FoveationStrength       ?? 32f;
+        private float P_FoveationInnerRadius => ActiveVariant?.FoveationInnerRadius    ?? 0.2f;
+        private float P_LodHysteresis        => ActiveVariant?.LodHysteresis           ?? 0.2f;
 
         private static readonly int PropPoints          = Shader.PropertyToID("_Points");
         private static readonly int PropNodeDescriptors = Shader.PropertyToID("_NodeDescriptors");
@@ -162,7 +172,10 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private BVHAsset _lastActiveAsset;
+        private BVHAsset  _lastActiveAsset;
+        private Material  _activeMaterialInstance;
+        private Material  _lastSourceMaterial;
+        private int       _lastSourceMaterialCRC;
 
         // CullingGroup state.
         private CullingGroup     _cullingGroup;
@@ -223,6 +236,20 @@ namespace StoryLabResearch.PointCloud
             return true;
         }
 
+        private void DestroyMaterialInstance()
+        {
+            if (_activeMaterialInstance == null) return;
+#if UNITY_EDITOR
+            if (!Application.isPlaying)
+                UnityEngine.Object.DestroyImmediate(_activeMaterialInstance);
+            else
+#endif
+                UnityEngine.Object.Destroy(_activeMaterialInstance);
+            _activeMaterialInstance = null;
+            _lastSourceMaterial     = null;
+            _lastBoundPointBuffer   = null;
+        }
+
         private void OnEnable()
         {
 #if UNITY_EDITOR
@@ -238,8 +265,10 @@ namespace StoryLabResearch.PointCloud
             DeregisterIndirect();
             DisposeCullingGroup();
             DisposeIndirectBuffers();
-            _assets.Quality?.Unload();
-            _assets.Performance?.Unload();
+            DestroyMaterialInstance();
+            if (_variants != null)
+                foreach (var entry in _variants)
+                    entry.Asset?.Unload();
         }
 
 #if UNITY_EDITOR
@@ -254,15 +283,24 @@ namespace StoryLabResearch.PointCloud
         {
             var asset = ActiveAsset;
             asset?.Load();
-            if (asset?.Root == null) return;
+            if (asset?.Root == null)
+            {
+                DeregisterIndirect();
+                return;
+            }
 
             var cam = ResolveCamera();
-            if (cam == null) return;
+            if (cam == null)
+            {
+                DeregisterIndirect();
+                return;
+            }
 
             if (asset != _lastActiveAsset)
             {
                 DisposeCullingGroup();
                 DisposeIndirectBuffers();
+                DestroyMaterialInstance();
                 _selectedCount   = 0;
                 _lastActiveAsset = asset;
             }
@@ -270,9 +308,7 @@ namespace StoryLabResearch.PointCloud
             if (P_OcclusionCulling)
                 RefreshCullingGroup(cam, asset);
             else
-            {
                 EnsureNodeIndex(asset);
-            }
 
             SelectNodes(cam, asset);
         }
@@ -291,8 +327,6 @@ namespace StoryLabResearch.PointCloud
 
         // ----- Node index (always maintained, regardless of occlusion culling) -----
 
-        // Populates _cullingNodes and all parallel arrays when occlusion culling is off.
-        // When occlusion culling is on, RefreshCullingGroup handles this during its rebuild.
         private void EnsureNodeIndex(BVHAsset asset)
         {
             if (_cullingNodes != null) return;
@@ -318,7 +352,6 @@ namespace StoryLabResearch.PointCloud
             _prevExpandedFlags = new bool[n];
             Array.Fill(_prevExpandedFlags, true);
 
-            // Pre-allocate heap and selected-indices to total node count.
             _heap            = new QueueEntry[n];
             _heapCount       = 0;
             _selectedIndices = new int[n];
@@ -381,7 +414,7 @@ namespace StoryLabResearch.PointCloud
             _cullingGroup?.Dispose();
             _cullingGroup     = null;
             _cullingCamera    = null;
-            _cullingNodes     = null; // null signals EnsureNodeIndex to rebuild when occlusion culling is off
+            _cullingNodes     = null;
             _cullingSpheres   = null;
             _cullingResults   = null;
             _lastLocalToWorld = Matrix4x4.zero;
@@ -405,13 +438,10 @@ namespace StoryLabResearch.PointCloud
         {
             var   localToWorld = transform.localToWorldMatrix;
 
-            // Hoist all camera interop calls — each crosses C++/C# boundary.
             var   camPos     = cam.transform.position;
             float halfFovTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             var   vpMatrix   = cam.projectionMatrix * cam.worldToCameraMatrix;
 
-            // Extract frustum planes to flat float arrays — eliminates Plane.normal/distance
-            // property interop from the HeapPush inner loop (6 reads × every node visited).
             GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
             for (int pi = 0; pi < 6; pi++)
             {
@@ -423,7 +453,6 @@ namespace StoryLabResearch.PointCloud
                 _fpD[pi]   = p.distance;
             }
 
-            // Hoist all P_* property reads — each dereferences ActiveProperties.
             bool  fovEnabled     = P_FoveationEnabled;
             float fovStrength    = P_FoveationStrength;
             float fovInner       = P_FoveationInnerRadius;
@@ -433,17 +462,20 @@ namespace StoryLabResearch.PointCloud
             bool  occlusionCull  = P_OcclusionCulling;
             int   remaining      = P_PointBudget;
 
-            // Squared threshold — eliminates Sqrt from every HeapPush screen-error calculation.
-            // All comparisons in the traversal loop use squared error; actual error is stored
-            // squared in QueueEntry.ScreenError throughout the traversal.
             float sqErrorThreshold    = errorThreshold * errorThreshold;
             float hysteresisMul       = 1f - lodHysteresis;
-            // Lowest possible effective threshold — below this, no node can ever be expanded
-            // regardless of hysteresis or foveation (foveation only raises the threshold).
-            // Used to early-drain the heap tail once all remaining entries are guaranteed selectable.
             float sqMinEffThreshold   = sqErrorThreshold * (hysteresisMul * hysteresisMul);
 
-            var   mat           = ActiveMaterial;
+            var sourceMat = ActiveMaterial;
+            int sourceCRC = sourceMat.ComputeCRC();
+            if (_activeMaterialInstance == null || sourceMat != _lastSourceMaterial || sourceCRC != _lastSourceMaterialCRC)
+            {
+                DestroyMaterialInstance();
+                _activeMaterialInstance = new Material(sourceMat) { hideFlags = HideFlags.HideAndDontSave };
+                _lastSourceMaterial     = sourceMat;
+                _lastSourceMaterialCRC  = sourceCRC;
+            }
+            var   mat           = _activeMaterialInstance;
             float pointSizeBase = P_PointSizeScale * 0.5f;
 
             if (asset.GlobalPointBuffer != null && asset.GlobalPointBuffer != _lastBoundPointBuffer)
@@ -452,12 +484,10 @@ namespace StoryLabResearch.PointCloud
                 _lastBoundPointBuffer = asset.GlobalPointBuffer;
             }
 
-            // Reset per-frame selection state — only touch indices written last frame.
             for (int i = 0; i < _selectedCount; i++)
                 _selectedError[_selectedIndices[i]] = -1f;
             _selectedCount = 0;
 
-            // _expandedFlags was swapped in from _prevExpandedFlags last frame; clear it for reuse.
             Array.Clear(_expandedFlags, 0, _expandedFlags.Length);
 
             _heapCount = 0;
@@ -476,17 +506,13 @@ namespace StoryLabResearch.PointCloud
                         int pi = parent.IndexInRenderer;
                         if (_selectedError[pi] < 0f)
                             _selectedIndices[_selectedCount++] = pi;
-                        _selectedError[pi] = entry.ScreenError; // stored squared
+                        _selectedError[pi] = entry.ScreenError;
                     }
                     continue;
                 }
 
-                // Early-drain: heap is max-ordered, so once the top entry is below the minimum
-                // possible effective threshold (hysteresis-adjusted, foveation only raises further)
-                // every remaining entry is also guaranteed selectable — no need to pop and evaluate.
                 if (entry.ScreenError < sqMinEffThreshold || remaining <= 0)
                 {
-                    // Select this entry and all remaining heap entries without further evaluation.
                     int nodeIdx = node.IndexInRenderer;
                     if (_selectedError[nodeIdx] < 0f)
                         _selectedIndices[_selectedCount++] = nodeIdx;
@@ -506,18 +532,16 @@ namespace StoryLabResearch.PointCloud
                     break;
                 }
 
-                // entry.ScreenError is squared; compare against squared threshold.
                 float sqEffectiveThreshold = sqErrorThreshold;
                 if (fovEnabled)
                 {
                     float t = FoveationT(vpMatrix, fovInner, entry.WorldCenter, entry.WorldExtentX, entry.WorldExtentY, entry.WorldExtentZ);
-                    // t in [0,1]; lerp(1, fovStrength, t) = 1 + (fovStrength-1)*t
                     float mul = 1f + (fovStrength - 1f) * t;
-                    sqEffectiveThreshold *= mul * mul; // square the linear multiplier
+                    sqEffectiveThreshold *= mul * mul;
                 }
 
-                int  nIdx      = node.IndexInRenderer;
-                bool wasExpanded  = _prevExpandedFlags[nIdx];
+                int  nIdx        = node.IndexInRenderer;
+                bool wasExpanded = _prevExpandedFlags[nIdx];
                 float sqThreshold = wasExpanded
                     ? sqEffectiveThreshold * (hysteresisMul * hysteresisMul)
                     : sqEffectiveThreshold;
@@ -532,32 +556,23 @@ namespace StoryLabResearch.PointCloud
 
                 if (_selectedError[nIdx] < 0f)
                     _selectedIndices[_selectedCount++] = nIdx;
-                _selectedError[nIdx] = entry.ScreenError; // stored squared
+                _selectedError[nIdx] = entry.ScreenError;
                 remaining -= node.PointCount;
             }
 
-            // Build indirect draw — one instanced call covering all selected nodes.
-            // NodeDescriptor layout in _nodeDescriptorBuffer (48 bytes = 3 float4s):
-            //   float4 a: boundsMin.xyz, lodScale
-            //   float4 b: boundsSize.xyz, <pad>
-            //   uint4  c: pointOffset, pointCount, 0, 0  (reinterpreted as float bits)
             LastFramePointsDrawn = 0;
-            // minDrawError comparison is also in squared space.
             float sqMinDrawError = sqErrorThreshold * (minDrawFrac * minDrawFrac);
             int   selectedCount  = _selectedCount;
 
-            // Double-buffered GPU buffers: CPU writes slot [_bufferIndex], GPU reads slot [1-_bufferIndex].
             _bufferIndex = 1 - _bufferIndex;
             int bi = _bufferIndex;
 
-            // Grow descriptor buffer for this slot if needed (50% headroom, never shrinks).
             if (selectedCount > _descriptorCapacity[bi])
             {
                 int newCapacity = selectedCount + selectedCount / 2;
                 _nodeDescriptorBuffer[bi]?.Release();
                 _nodeDescriptorBuffer[bi] = new GraphicsBuffer(GraphicsBuffer.Target.Structured, newCapacity * 3, 16);
                 _descriptorCapacity[bi]   = newCapacity;
-                // Staging array is shared; grow it to the larger of the two slots' capacities.
                 int stagingSize = newCapacity * 12;
                 if (_nodeDescriptorData == null || _nodeDescriptorData.Length < stagingSize)
                     _nodeDescriptorData = new float[stagingSize];
@@ -568,14 +583,13 @@ namespace StoryLabResearch.PointCloud
                 _indirectArgsData       = new uint[4];
             }
 
-            // Single pass: fill descriptor array, tracking valid count and max point count inline.
             int  validCount    = 0;
             int  maxPointCount = 0;
             for (int s = 0; s < selectedCount; s++)
             {
                 int   idx         = _selectedIndices[s];
                 var   node        = _cullingNodes[idx];
-                float sqError     = _selectedError[idx]; // stored squared
+                float sqError     = _selectedError[idx];
                 if (node.PointCount == 0) continue;
                 if (minDrawFrac > 0f && sqError < sqMinDrawError) continue;
                 bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
@@ -587,17 +601,14 @@ namespace StoryLabResearch.PointCloud
                 float lodScale = node.LodScaleBase * pointSizeBase;
                 int   o        = validCount * 12;
 
-                // float4 a
                 _nodeDescriptorData[o + 0] = node.BoundsMin.x;
                 _nodeDescriptorData[o + 1] = node.BoundsMin.y;
                 _nodeDescriptorData[o + 2] = node.BoundsMin.z;
                 _nodeDescriptorData[o + 3] = lodScale;
-                // float4 b
                 _nodeDescriptorData[o + 4] = node.BoundsSize.x;
                 _nodeDescriptorData[o + 5] = node.BoundsSize.y;
                 _nodeDescriptorData[o + 6] = node.BoundsSize.z;
                 _nodeDescriptorData[o + 7] = 0f;
-                // uint4 c — reinterpret int bits into the float array
                 _nodeDescriptorData[o +  8] = BitConverter.Int32BitsToSingle(node.GlobalBufferOffset);
                 _nodeDescriptorData[o +  9] = BitConverter.Int32BitsToSingle(node.PointCount);
                 _nodeDescriptorData[o + 10] = 0f;
@@ -615,18 +626,13 @@ namespace StoryLabResearch.PointCloud
             }
 
             _nodeDescriptorBuffer[bi].SetData(_nodeDescriptorData, 0, 0, validCount * 12);
-            _indirectArgsData[0] = (uint)(maxPointCount * 6); // 6 verts per point (2 triangles)
-            // Under single-pass instanced stereo, Unity cannot auto-double the instance count for
-            // indirect draws (the args buffer is opaque to it). We double manually so SV_InstanceID
-            // covers [0, validCount*2), letting UNITY_SETUP_INSTANCE_ID decode eye (bit 0) and
-            // node index (>> 1) correctly.
+            _indirectArgsData[0] = (uint)(maxPointCount * 6);
             bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
             _indirectArgsData[1] = (uint)(stereoInstanced ? validCount * 2 : validCount);
             _indirectArgsData[2] = 0;
             _indirectArgsData[3] = 0;
             _indirectArgsBuffer[bi].SetData(_indirectArgsData);
 
-            // Bind this frame's buffer slot to the material — cheap with a single draw call per cloud.
             mat.SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer[bi]);
 
             if (_indirectDrawable == null)
@@ -636,44 +642,31 @@ namespace StoryLabResearch.PointCloud
             }
             _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], localToWorld);
 
-            // Swap expanded-flags arrays: this frame's expansions become next frame's hysteresis reference.
             (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
         }
 
 
         // ----- Foveation helpers -----
 
-        // Returns t in [0,1]: 0 = inside foveal zone (no penalty), 1 = full peripheral penalty.
-        // Projects the node's world-space AABB into viewport space, finds the closest point on the
-        // resulting screen-space box to the foveation centre, and uses that distance for the test.
-        // This correctly protects nodes whose bounds overlap the inner zone even if their centre
-        // lies outside it, handling elongated nodes that the old scalar nodeRadius approach missed.
-        // t ramps linearly from 0 at fovInner to 1 at 2*fovInner.
         private float FoveationT(Matrix4x4 vp, float fovInner, Vector3 worldCenter,
             float wex, float wey, float wez)
         {
-            // Project centre.
             float hx = vp.m00 * worldCenter.x + vp.m01 * worldCenter.y + vp.m02 * worldCenter.z + vp.m03;
             float hy = vp.m10 * worldCenter.x + vp.m11 * worldCenter.y + vp.m12 * worldCenter.z + vp.m13;
             float hw = vp.m30 * worldCenter.x + vp.m31 * worldCenter.y + vp.m32 * worldCenter.z + vp.m33;
-            if (hw <= 0f) return 0f; // behind camera — never penalise
+            if (hw <= 0f) return 0f;
             float invW = 1f / hw;
             float vpx  = hx * invW * 0.5f + 0.5f;
             float vpy  = hy * invW * 0.5f + 0.5f;
 
-            // Project world extents into screen space (NDC half-extents).
-            // Uses the upper-left 2×3 of the VP matrix, divided by W — same AABB projection
-            // as the world transform, applied to the view-projection matrix.
             float m00 = vp.m00, m01 = vp.m01, m02 = vp.m02;
             float m10 = vp.m10, m11 = vp.m11, m12 = vp.m12;
             float sex = ((m00 >= 0f ? m00 : -m00) * wex + (m01 >= 0f ? m01 : -m01) * wey + (m02 >= 0f ? m02 : -m02) * wez) * invW * 0.5f;
             float sey = ((m10 >= 0f ? m10 : -m10) * wex + (m11 >= 0f ? m11 : -m11) * wey + (m12 >= 0f ? m12 : -m12) * wez) * invW * 0.5f;
 
-            // Screen-space AABB of this node in viewport coords.
             float sminX = vpx - sex, smaxX = vpx + sex;
             float sminY = vpy - sey, smaxY = vpy + sey;
 
-            // Closest point on screen box to foveation centre (Chebyshev distance).
             float fcx = FoveationCentre.x, fcy = FoveationCentre.y;
             float closestX = fcx < sminX ? sminX : fcx > smaxX ? smaxX : fcx;
             float closestY = fcy < sminY ? sminY : fcy > smaxY ? smaxY : fcy;
@@ -681,7 +674,6 @@ namespace StoryLabResearch.PointCloud
             float dy = closestY - fcy; if (dy < 0f) dy = -dy;
             float r  = dx > dy ? dx : dy;
 
-            // Early exits before ramp math.
             if (r <= fovInner)            return 0f;
             if (r >= fovInner + fovInner) return 1f;
             float t = (r - fovInner) / fovInner;
@@ -696,7 +688,6 @@ namespace StoryLabResearch.PointCloud
             if (node == null) return;
             if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
 
-            // Transform AABB — no Bounds construction, no property getters.
             float lx = node.BoundsMin.x,  ly = node.BoundsMin.y,  lz = node.BoundsMin.z;
             float sx = node.BoundsSize.x, sy = node.BoundsSize.y, sz = node.BoundsSize.z;
             float cx = lx + sx * 0.5f,   cy = ly + sy * 0.5f,    cz = lz + sz * 0.5f;
@@ -704,7 +695,6 @@ namespace StoryLabResearch.PointCloud
             float wcy = m.m10 * cx + m.m11 * cy + m.m12 * cz + m.m13;
             float wcz = m.m20 * cx + m.m21 * cy + m.m22 * cz + m.m23;
             float ex  = sx * 0.5f, ey = sy * 0.5f, ez = sz * 0.5f;
-            // Inline Abs — avoids Mathf.Abs call overhead; compiler sees constant-sign branches.
             float m00 = m.m00, m01 = m.m01, m02 = m.m02;
             float m10 = m.m10, m11 = m.m11, m12 = m.m12;
             float m20 = m.m20, m21 = m.m21, m22 = m.m22;
@@ -714,7 +704,6 @@ namespace StoryLabResearch.PointCloud
             float wminX = wcx - wex, wminY = wcy - wey, wminZ = wcz - wez;
             float wmaxX = wcx + wex, wmaxY = wcy + wey, wmaxZ = wcz + wez;
 
-            // Frustum test using pre-extracted plane floats — no Plane property access.
             float nx, ny, nz, d;
             nx = _fpNx[0]; ny = _fpNy[0]; nz = _fpNz[0]; d = _fpD[0];
             if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
@@ -729,8 +718,6 @@ namespace StoryLabResearch.PointCloud
             nx = _fpNx[5]; ny = _fpNy[5]; nz = _fpNz[5]; d = _fpD[5];
             if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
 
-            // Squared screen error — eliminates Sqrt entirely.
-            // sqError = (maxExtent / (dist * halfFovTan))² = maxExtent² / (sqrDist * halfFovTan²)
             float ddx = camPos.x < wminX ? wminX - camPos.x : camPos.x > wmaxX ? camPos.x - wmaxX : 0f;
             float ddy = camPos.y < wminY ? wminY - camPos.y : camPos.y > wmaxY ? camPos.y - wmaxY : 0f;
             float ddz = camPos.z < wminZ ? wminZ - camPos.z : camPos.z > wmaxZ ? camPos.z - wmaxZ : 0f;
@@ -797,9 +784,7 @@ namespace StoryLabResearch.PointCloud
             _lastBoundPointBuffer = null;
         }
 
-        // ----- Utilities -----
-
-        // Used only by the cold-path culling group sphere rebuild — hot path uses inlined HeapPush.
+        // Used only by the cold-path culling group sphere rebuild.
         private static Bounds TransformBounds(Bounds localBounds, Matrix4x4 m)
         {
             var center  = m.MultiplyPoint3x4(localBounds.center);
@@ -818,9 +803,9 @@ namespace StoryLabResearch.PointCloud
             public readonly BVHNode Node;
             public readonly BVHNode Parent;
             public readonly float   ScreenError;
-            public readonly Vector3 WorldCenter;  // precomputed world-space centre, used by foveation
-            public readonly float   WorldExtentX; // world-space AABB half-extents, used by foveation
-            public readonly float   WorldExtentY; // to project a screen-space box around the centre
+            public readonly Vector3 WorldCenter;
+            public readonly float   WorldExtentX;
+            public readonly float   WorldExtentY;
             public readonly float   WorldExtentZ;
             public QueueEntry(BVHNode node, BVHNode parent, float screenError,
                 Vector3 worldCenter, float wex, float wey, float wez)
@@ -854,12 +839,13 @@ namespace StoryLabResearch.PointCloud
 #if UNITY_EDITOR
         private void OnDrawGizmos()
         {
-            if (!P_FoveationEnabled) return;
+            var variant = ActiveVariant;
+            if (variant == null || !variant.FoveationEnabled) return;
 
             var cam = Camera.current;
             if (cam == null) return;
 
-            float   inner  = P_FoveationInnerRadius;
+            float   inner  = variant.FoveationInnerRadius;
             Vector2 centre = FoveationCentre;
             float   depth  = (cam.nearClipPlane + cam.farClipPlane) * 0.5f;
 
