@@ -329,7 +329,7 @@ namespace StoryLabResearch.PointCloud
 
         private void EnsureNodeIndex(BVHAsset asset)
         {
-            if (_cullingNodes != null) return;
+            if (_cullingNodes != null && _lastActiveAsset == asset) return;
 
             var nodes = new List<BVHNode>();
             CollectNodes(asset.Root, nodes);
