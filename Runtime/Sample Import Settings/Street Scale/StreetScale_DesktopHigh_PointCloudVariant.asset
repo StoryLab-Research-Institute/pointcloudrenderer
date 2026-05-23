@@ -10,7 +10,7 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 59b823ada5c354946ba14999dbfcb4b2, type: 3}
-  m_Name: DesktopHigh_PointCloudVariant
+  m_Name: StreetScale_DesktopHigh_PointCloudVariant
   m_EditorClassIdentifier: 
   VariantName: High
   Platforms: 1
