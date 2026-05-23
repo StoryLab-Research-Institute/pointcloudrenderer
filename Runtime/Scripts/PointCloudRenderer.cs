@@ -274,7 +274,7 @@ namespace StoryLabResearch.PointCloud
 #if UNITY_EDITOR
         private void EditorTick()
         {
-            if (this == null || Application.isPlaying) return;
+            if (this == null || Application.isPlaying || !isActiveAndEnabled) return;
             Update();
         }
 #endif
@@ -329,7 +329,7 @@ namespace StoryLabResearch.PointCloud
 
         private void EnsureNodeIndex(BVHAsset asset)
         {
-            if (_cullingNodes != null && _lastActiveAsset == asset) return;
+            if (_cullingNodes != null) return;
 
             var nodes = new List<BVHNode>();
             CollectNodes(asset.Root, nodes);
@@ -686,7 +686,7 @@ namespace StoryLabResearch.PointCloud
             Matrix4x4 m, bool occlusionCull)
         {
             if (node == null) return;
-            if (occlusionCull && node.IndexInRenderer >= 0 && node.IndexInRenderer < _occludedFlags.Length && _occludedFlags[node.IndexInRenderer]) return;
+            if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
 
             float lx = node.BoundsMin.x,  ly = node.BoundsMin.y,  lz = node.BoundsMin.z;
             float sx = node.BoundsSize.x, sy = node.BoundsSize.y, sz = node.BoundsSize.z;
