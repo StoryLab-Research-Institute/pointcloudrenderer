@@ -686,7 +686,7 @@ namespace StoryLabResearch.PointCloud
             Matrix4x4 m, bool occlusionCull)
         {
             if (node == null) return;
-            if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
+            if (occlusionCull && node.IndexInRenderer >= 0 && node.IndexInRenderer < _occludedFlags.Length && _occludedFlags[node.IndexInRenderer]) return;
 
             float lx = node.BoundsMin.x,  ly = node.BoundsMin.y,  lz = node.BoundsMin.z;
             float sx = node.BoundsSize.x, sy = node.BoundsSize.y, sz = node.BoundsSize.z;
