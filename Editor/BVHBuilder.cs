@@ -35,10 +35,9 @@ namespace StoryLabResearch.PointCloud
             if (minPointSpacing > 0f)
             {
                 EditorUtility.DisplayProgressBar("Building BVH", "Pre-thinning points...", 0.02f);
-                var preBounds  = ComputeBoundsFromRange(positions, 0, totalPoints);
                 var allIndices = new int[totalPoints];
                 for (int i = 0; i < totalPoints; i++) allIndices[i] = i;
-                indices = GlobalGridSubsample(positions, allIndices, preBounds, minPointSpacing);
+                indices = SphereExclusionSubsample(positions, allIndices, minPointSpacing);
                 Debug.Log($"[BVHBuilder] Pre-thin: {totalPoints} → {indices.Length} points " +
                           $"(spacing {minPointSpacing:F4}m).");
                 totalPoints = indices.Length;
@@ -194,6 +193,7 @@ namespace StoryLabResearch.PointCloud
         }
 
         // Grid subsample: keeps at most one point per cell of a uniform grid over bounds.
+        // Used for LOD representative selection at internal BVH nodes.
         private static int[] GridSubsample(Vector3[] positions, int[] indices, int start, int count,
             Bounds bounds, int gridRes, int targetCount)
         {
@@ -219,24 +219,59 @@ namespace StoryLabResearch.PointCloud
             return result.ToArray();
         }
 
-        // Global pre-thinning: one cell per minSpacing across the whole cloud.
-        private static int[] GlobalGridSubsample(Vector3[] positions, int[] indices, Bounds bounds, float minSpacing)
+        // Sphere-exclusion spatial resampling (equivalent to CloudCompare resampleCloudSpatially).
+        //
+        // For each point in input order, keep it if no already-kept point lies within minSpacing.
+        // Uses a voxel hash (cell side = minSpacing) as an acceleration structure: only the 27
+        // cells surrounding a candidate need to be checked. This eliminates the periodic grid
+        // artefacts produced by the previous GlobalGridSubsample approach, because kept points
+        // are irregular — there is no axis-aligned cell boundary that can produce coherent stripes.
+        private static int[] SphereExclusionSubsample(Vector3[] positions, int[] indices, float minSpacing)
         {
-            var cellOccupied = new HashSet<long>(indices.Length / 4);
-            var result       = new List<int>(indices.Length);
-            var bMin         = bounds.min;
-            float inv        = 1f / minSpacing;
+            float minSpacingSq = minSpacing * minSpacing;
+            float inv          = 1f / minSpacing;
+
+            // Maps voxel key → list of already-kept point positions in that voxel.
+            var voxelMap = new Dictionary<long, List<Vector3>>(indices.Length / 8);
+            var result   = new List<int>(indices.Length / 4);
 
             for (int i = 0; i < indices.Length; i++)
             {
-                var  p  = positions[indices[i]] - bMin;
-                long cx = (long)(p.x * inv);
-                long cy = (long)(p.y * inv);
-                long cz = (long)(p.z * inv);
-                long key = cx * 2_000_003L + cy * 1_999_979L + cz;
-                if (cellOccupied.Add(key))
-                    result.Add(indices[i]);
+                Vector3 p  = positions[indices[i]];
+                long    vx = (long)Math.Floor(p.x * inv);
+                long    vy = (long)Math.Floor(p.y * inv);
+                long    vz = (long)Math.Floor(p.z * inv);
+
+                // Check all 27 neighbouring voxels for a point within minSpacing.
+                bool tooClose = false;
+                for (int dx = -1; dx <= 1 && !tooClose; dx++)
+                for (int dy = -1; dy <= 1 && !tooClose; dy++)
+                for (int dz = -1; dz <= 1 && !tooClose; dz++)
+                {
+                    long nkey = (vx + dx) * 2_000_003L + (vy + dy) * 1_999_979L + (vz + dz);
+                    if (!voxelMap.TryGetValue(nkey, out var bucket)) continue;
+                    foreach (var kept in bucket)
+                    {
+                        float sqDist = (p.x - kept.x) * (p.x - kept.x)
+                                     + (p.y - kept.y) * (p.y - kept.y)
+                                     + (p.z - kept.z) * (p.z - kept.z);
+                        if (sqDist < minSpacingSq) { tooClose = true; break; }
+                    }
+                }
+
+                if (tooClose) continue;
+
+                // Keep this point and register it in the voxel map.
+                long key = vx * 2_000_003L + vy * 1_999_979L + vz;
+                if (!voxelMap.TryGetValue(key, out var slot))
+                {
+                    slot = new List<Vector3>(2);
+                    voxelMap[key] = slot;
+                }
+                slot.Add(p);
+                result.Add(indices[i]);
             }
+
             return result.ToArray();
         }
 
