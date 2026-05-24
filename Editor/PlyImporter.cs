@@ -178,9 +178,9 @@ namespace StoryLabResearch.PointCloud
                 var body   = ReadDataBody(header, new BinaryReader(stream));
                 stream.Close();
 
-                int count = body.vertices.Count;
-                positions = new Vector3[count];
-                colors    = new uint[count];
+                int count    = body.vertices.Count;
+                var posLocal = new Vector3[count];
+                var clrLocal = new uint[count];
 
                 EAxis ax, ay, az;
                 switch (AxisPreset)
@@ -193,17 +193,20 @@ namespace StoryLabResearch.PointCloud
                 }
                 bool swizzle = AxisPreset != EAxisPreset.None;
 
-                var verts  = body.vertices;
-                var clrs   = body.colors;
+                var verts = body.vertices;
+                var clrs  = body.colors;
                 System.Threading.Tasks.Parallel.For(0, count, i =>
                 {
                     var p = verts[i];
-                    positions[i] = swizzle
+                    posLocal[i] = swizzle
                         ? new Vector3(SampleAxis(p, ax), SampleAxis(p, ay), SampleAxis(p, az))
                         : p;
                     var c = clrs[i];
-                    colors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16);
+                    clrLocal[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16);
                 });
+
+                positions = posLocal;
+                colors    = clrLocal;
             }
             catch (Exception e)
             {
