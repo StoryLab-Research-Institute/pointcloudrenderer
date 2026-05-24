@@ -69,7 +69,7 @@ namespace StoryLabResearch.PointCloud
             var bvhData      = new BVHBuilder.BVHData[variants.Length];
             var deferredLogs = new List<string>[variants.Length];
             for (int i = 0; i < variants.Length; i++)
-                deferredLogs[i] = [];
+                deferredLogs[i] = new List<string>();
 
             // Compute BVH data in parallel — pure computation, no Unity API calls.
             System.Threading.Tasks.Parallel.For(0, variants.Length, i =>
