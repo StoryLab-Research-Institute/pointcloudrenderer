@@ -36,6 +36,11 @@ namespace StoryLabResearch.PointCloud
         public float Rescale = 1.0f;
         public bool ApplySRGBCorrection;
 
+        [Tooltip("Shuffle point order before building the BVH to avoid LOD artefacts from scanner scan-line ordering.")]
+        public bool ShufflePoints = true;
+        [Tooltip("Seed for the point shuffle. Generated once when the .ply is first imported and stored in the .meta file.")]
+        public int ShuffleSeed = new Random().Next(1, int.MaxValue);
+
         [Tooltip("Optional shared import properties asset. When set, overrides the variant list below.")]
         public PointCloudImportProperties ImportProperties;
 
@@ -51,6 +56,9 @@ namespace StoryLabResearch.PointCloud
 
             ReadPointData(context.assetPath, out var positions, out var colors);
             if (positions == null) return;
+
+            if (ShufflePoints)
+                ShuffleArrays(positions, colors, ShuffleSeed);
 
             var name     = Path.GetFileNameWithoutExtension(context.assetPath);
             var variants = ResolvedVariants;
@@ -162,6 +170,17 @@ namespace StoryLabResearch.PointCloud
 
                 default: // Shared
                     return sourceMat;
+            }
+        }
+
+        private static void ShuffleArrays(Vector3[] positions, uint[] colors, int seed)
+        {
+            var rng = new Random(seed);
+            for (int i = positions.Length - 1; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                (positions[i], positions[j]) = (positions[j], positions[i]);
+                (colors[i],    colors[j])    = (colors[j],    colors[i]);
             }
         }
 
