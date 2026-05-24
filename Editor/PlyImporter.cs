@@ -52,8 +52,6 @@ namespace StoryLabResearch.PointCloud
             ReadPointData(context.assetPath, out var positions, out var colors);
             if (positions == null) return;
 
-            ApplyAxisSwizzle(positions);
-
             var name     = Path.GetFileNameWithoutExtension(context.assetPath);
             var variants = ResolvedVariants;
 
@@ -68,6 +66,18 @@ namespace StoryLabResearch.PointCloud
             var renderer = go.AddComponent<PointCloudRenderer>();
 
             var entries = new PointCloudRenderer.VariantEntry[variants.Length];
+            var assets  = new BVHAsset[variants.Length];
+
+            // Build each variant's BVH in parallel — these are pure computation with no shared writes.
+            System.Threading.Tasks.Parallel.For(0, variants.Length, i =>
+            {
+                var variant = variants[i];
+                if (variant == null) return;
+                assets[i] = BVHBuilder.BuildFromPointsEmbedded(
+                    positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength);
+            });
+
+            // Asset registration and material resolution must happen on the main thread.
             for (int i = 0; i < variants.Length; i++)
             {
                 var variant = variants[i];
@@ -77,8 +87,7 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                var asset = BVHBuilder.BuildFromPointsEmbedded(
-                    positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength);
+                var asset = assets[i];
                 if (asset == null) continue;
 
                 var safeName = string.IsNullOrWhiteSpace(variant.VariantName)
@@ -147,28 +156,6 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private void ApplyAxisSwizzle(Vector3[] positions)
-        {
-            EAxis ax, ay, az;
-            switch (AxisPreset)
-            {
-                case EAxisPreset.ZUpLeftHanded:  ax = EAxis.PosX; ay = EAxis.PosZ; az = EAxis.PosY; break;
-                case EAxisPreset.ZUpRightHanded: ax = EAxis.NegX; ay = EAxis.PosZ; az = EAxis.PosY; break;
-                case EAxisPreset.YUpRightHanded: ax = EAxis.PosX; ay = EAxis.PosY; az = EAxis.NegZ; break;
-                case EAxisPreset.None:           return;
-                default: /* Custom */            ax = AxisX; ay = AxisY; az = AxisZ; break;
-            }
-
-            for (int i = 0; i < positions.Length; i++)
-            {
-                var p = positions[i];
-                positions[i] = new Vector3(
-                    SampleAxis(p, ax),
-                    SampleAxis(p, ay),
-                    SampleAxis(p, az));
-            }
-        }
-
         private static float SampleAxis(Vector3 p, EAxis axis)
         {
             switch (axis)
@@ -188,25 +175,41 @@ namespace StoryLabResearch.PointCloud
             {
                 var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
                 var header = ReadDataHeader(new StreamReader(stream));
-                var body = ReadDataBody(header, new BinaryReader(stream));
+                var body   = ReadDataBody(header, new BinaryReader(stream));
                 stream.Close();
 
                 int count = body.vertices.Count;
                 positions = new Vector3[count];
-                colors = new uint[count];
+                colors    = new uint[count];
 
-                for (int i = 0; i < count; i++)
+                EAxis ax, ay, az;
+                switch (AxisPreset)
                 {
-                    positions[i] = body.vertices[i];
-                    var c = body.colors[i];
-                    colors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16);
+                    case EAxisPreset.ZUpLeftHanded:  ax = EAxis.PosX; ay = EAxis.PosZ; az = EAxis.PosY; break;
+                    case EAxisPreset.ZUpRightHanded: ax = EAxis.NegX; ay = EAxis.PosZ; az = EAxis.PosY; break;
+                    case EAxisPreset.YUpRightHanded: ax = EAxis.PosX; ay = EAxis.PosY; az = EAxis.NegZ; break;
+                    case EAxisPreset.None:           ax = EAxis.PosX; ay = EAxis.PosY; az = EAxis.PosZ; break;
+                    default: /* Custom */            ax = AxisX;      ay = AxisY;      az = AxisZ;      break;
                 }
+                bool swizzle = AxisPreset != EAxisPreset.None;
+
+                var verts  = body.vertices;
+                var clrs   = body.colors;
+                System.Threading.Tasks.Parallel.For(0, count, i =>
+                {
+                    var p = verts[i];
+                    positions[i] = swizzle
+                        ? new Vector3(SampleAxis(p, ax), SampleAxis(p, ay), SampleAxis(p, az))
+                        : p;
+                    var c = clrs[i];
+                    colors[i] = (uint)c.r | ((uint)c.g << 8) | ((uint)c.b << 16);
+                });
             }
             catch (Exception e)
             {
                 Debug.LogError($"[PlyImporter] Failed reading {path}: {e.Message}");
                 positions = null;
-                colors = null;
+                colors    = null;
             }
         }
 
