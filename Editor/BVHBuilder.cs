@@ -11,38 +11,47 @@ namespace StoryLabResearch.PointCloud
         private const int TargetPointsPerNode = 16384;
         private const int MaxDepth            = 24; // binary tree goes deeper than octree for same data
 
+        public struct BVHData
+        {
+            public BVHAsset.PublicNodeMetadata[] Metadata;
+            public byte[]                        PointData;
+        }
+
+        // Full pipeline: compute + create asset. Must be called from the main thread.
         public static BVHAsset BuildFromPointsEmbedded(
             Vector3[] positions, uint[] colors,
             float minPointSpacing = 0f, float maxNodeSideLength = 0f)
         {
+            var logs = new System.Collections.Generic.List<string>();
             try
             {
-                return BuildInternal(positions, colors, minPointSpacing, maxNodeSideLength);
+                var data  = ComputeBVHData(positions, colors, minPointSpacing, maxNodeSideLength, logs);
+                var asset = CreateAsset(data);
+                return asset;
             }
             finally
             {
-                if (System.Threading.Thread.CurrentThread.ManagedThreadId == 1)
-                    EditorUtility.ClearProgressBar();
+                foreach (var msg in logs) Debug.Log(msg);
+                EditorUtility.ClearProgressBar();
             }
         }
 
-        private static BVHAsset BuildInternal(
+        // Pure computation — no Unity API calls, safe to call from any thread.
+        public static BVHData ComputeBVHData(
             Vector3[] positions, uint[] colors,
-            float minPointSpacing, float maxNodeSideLength)
+            float minPointSpacing, float maxNodeSideLength,
+            System.Collections.Generic.List<string> deferredLogs = null)
         {
             int totalPoints = positions.Length;
 
             int[] indices;
-            bool isMainThread = System.Threading.Thread.CurrentThread.ManagedThreadId == 1;
-
             if (minPointSpacing > 0f)
             {
-                if (isMainThread) EditorUtility.DisplayProgressBar("Building BVH", "Pre-thinning points...", 0.02f);
                 var allIndices = new int[totalPoints];
                 for (int i = 0; i < totalPoints; i++) allIndices[i] = i;
                 indices = SphereExclusionSubsample(positions, allIndices, minPointSpacing);
-                Debug.Log($"[BVHBuilder] Pre-thin: {totalPoints} → {indices.Length} points " +
-                          $"(spacing {minPointSpacing:F4}m).");
+                deferredLogs?.Add($"[BVHBuilder] Pre-thin: {totalPoints} → {indices.Length} points " +
+                                  $"(spacing {minPointSpacing:F4}m).");
                 totalPoints = indices.Length;
             }
             else
@@ -51,15 +60,11 @@ namespace StoryLabResearch.PointCloud
                 for (int i = 0; i < totalPoints; i++) indices[i] = i;
             }
 
-            if (isMainThread) EditorUtility.DisplayProgressBar("Building BVH", "Building tree...", 0.05f);
-
             var metaList  = new List<BVHAsset.PublicNodeMetadata>();
             var binChunks = new List<byte[]>();
 
             BuildNode(positions, colors, indices, 0, totalPoints,
-                0, metaList, binChunks, totalPoints, maxNodeSideLength, isMainThread);
-
-            if (isMainThread) EditorUtility.DisplayProgressBar("Building BVH", "Assembling point data...", 0.92f);
+                0, metaList, binChunks, totalPoints, maxNodeSideLength);
 
             int totalBytes = 0;
             foreach (var chunk in binChunks)
@@ -73,13 +78,17 @@ namespace StoryLabResearch.PointCloud
                 writePos += chunk.Length;
             }
 
-            if (isMainThread) EditorUtility.DisplayProgressBar("Building BVH", "Creating asset...", 0.97f);
+            deferredLogs?.Add($"[BVHBuilder] Built {metaList.Count} nodes, " +
+                              $"{totalBytes / 1024 / 1024} MB embedded.");
+            return new BVHData { Metadata = metaList.ToArray(), PointData = pointData };
+        }
 
+        // Must be called from the main thread.
+        public static BVHAsset CreateAsset(BVHData data)
+        {
             var asset = ScriptableObject.CreateInstance<BVHAsset>();
             asset.name = "BVHAsset";
-            asset.SetData(metaList.ToArray(), pointData);
-
-            Debug.Log($"[BVHBuilder] Built {metaList.Count} nodes, {totalBytes / 1024 / 1024} MB embedded.");
+            asset.SetData(data.Metadata, data.PointData);
             return asset;
         }
 
@@ -91,11 +100,8 @@ namespace StoryLabResearch.PointCloud
             int depth,
             List<BVHAsset.PublicNodeMetadata> metaList,
             List<byte[]> binChunks,
-            int totalPoints, float maxNodeSideLength, bool isMainThread = true)
+            int totalPoints, float maxNodeSideLength)
         {
-            if (isMainThread) EditorUtility.DisplayProgressBar("Building BVH",
-                $"Depth {depth}: {count} points", 0.05f + 0.87f * (1f - (float)count / totalPoints));
-
             int nodeIndex = metaList.Count;
             metaList.Add(default);
             int chunkIndex = binChunks.Count;
@@ -173,14 +179,14 @@ namespace StoryLabResearch.PointCloud
             {
                 leftIndex = metaList.Count;
                 BuildNode(positions, colors, indices, start, leftCount,
-                    depth + 1, metaList, binChunks, totalPoints, maxNodeSideLength, isMainThread);
+                    depth + 1, metaList, binChunks, totalPoints, maxNodeSideLength);
             }
 
             if (rightCount > 0)
             {
                 rightIndex = metaList.Count;
                 BuildNode(positions, colors, indices, start + leftCount, rightCount,
-                    depth + 1, metaList, binChunks, totalPoints, maxNodeSideLength, isMainThread);
+                    depth + 1, metaList, binChunks, totalPoints, maxNodeSideLength);
             }
 
             metaList[nodeIndex] = new BVHAsset.PublicNodeMetadata
@@ -212,9 +218,9 @@ namespace StoryLabResearch.PointCloud
             {
                 int idx = indices[i];
                 var p   = positions[idx] - bMin;
-                int cx  = Mathf.Clamp((int)(p.x * invX), 0, gridRes - 1);
-                int cy  = Mathf.Clamp((int)(p.y * invY), 0, gridRes - 1);
-                int cz  = Mathf.Clamp((int)(p.z * invZ), 0, gridRes - 1);
+                int cx  = Math.Max(0, Math.Min(gridRes - 1, (int)(p.x * invX)));
+                int cy  = Math.Max(0, Math.Min(gridRes - 1, (int)(p.y * invY)));
+                int cz  = Math.Max(0, Math.Min(gridRes - 1, (int)(p.z * invZ)));
                 long key = cx + gridRes * (cy + (long)gridRes * cz);
                 if (cellOccupied.Add(key))
                     result.Add(idx);
@@ -326,9 +332,9 @@ namespace StoryLabResearch.PointCloud
             {
                 int idx = indices[start + i];
                 var p   = positions[idx] - bMin;
-                uint qx = (uint)Mathf.Clamp(Mathf.RoundToInt(p.x * invX), 0, 65535);
-                uint qy = (uint)Mathf.Clamp(Mathf.RoundToInt(p.y * invY), 0, 65535);
-                uint qz = (uint)Mathf.Clamp(Mathf.RoundToInt(p.z * invZ), 0, 65535);
+                uint qx = (uint)Math.Max(0, Math.Min(65535, (int)Math.Round(p.x * invX)));
+                uint qy = (uint)Math.Max(0, Math.Min(65535, (int)Math.Round(p.y * invY)));
+                uint qz = (uint)Math.Max(0, Math.Min(65535, (int)Math.Round(p.z * invZ)));
 
                 uint rgb   = colors[idx] & 0x00FFFFFFu; // strip alpha
                 uint word0 = (qy << 16) | qx;

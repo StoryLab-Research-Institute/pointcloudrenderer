@@ -65,21 +65,29 @@ namespace StoryLabResearch.PointCloud
             var go       = new GameObject(name);
             var renderer = go.AddComponent<PointCloudRenderer>();
 
-            var entries = new PointCloudRenderer.VariantEntry[variants.Length];
-            var assets  = new BVHAsset[variants.Length];
+            var entries      = new PointCloudRenderer.VariantEntry[variants.Length];
+            var bvhData      = new BVHBuilder.BVHData[variants.Length];
+            var deferredLogs = new List<string>[variants.Length];
+            for (int i = 0; i < variants.Length; i++)
+                deferredLogs[i] = [];
 
-            // Build each variant's BVH in parallel — these are pure computation with no shared writes.
+            // Compute BVH data in parallel — pure computation, no Unity API calls.
             System.Threading.Tasks.Parallel.For(0, variants.Length, i =>
             {
                 var variant = variants[i];
                 if (variant == null) return;
-                assets[i] = BVHBuilder.BuildFromPointsEmbedded(
-                    positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength);
+                bvhData[i] = BVHBuilder.ComputeBVHData(
+                    positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength,
+                    deferredLogs[i]);
             });
 
-            // Asset registration and material resolution must happen on the main thread.
+            EditorUtility.ClearProgressBar();
+
+            // CreateInstance, asset registration, material resolution, and logging on the main thread.
             for (int i = 0; i < variants.Length; i++)
             {
+                foreach (var msg in deferredLogs[i]) Debug.Log(msg);
+
                 var variant = variants[i];
                 if (variant == null)
                 {
@@ -87,8 +95,9 @@ namespace StoryLabResearch.PointCloud
                     continue;
                 }
 
-                var asset = assets[i];
-                if (asset == null) continue;
+                var data  = bvhData[i];
+                if (data.Metadata == null) continue;
+                var asset = BVHBuilder.CreateAsset(data);
 
                 var safeName = string.IsNullOrWhiteSpace(variant.VariantName)
                     ? $"Variant{i}"
