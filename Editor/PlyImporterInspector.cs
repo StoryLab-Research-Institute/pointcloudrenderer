@@ -14,6 +14,8 @@ namespace StoryLabResearch.PointCloud
         SerializedProperty _axisZ;
         SerializedProperty _rescale;
         SerializedProperty _applySRGBCorrection;
+        SerializedProperty _shufflePoints;
+        SerializedProperty _shuffleSeed;
         SerializedProperty _importProperties;
         SerializedProperty _variants;
 
@@ -29,6 +31,8 @@ namespace StoryLabResearch.PointCloud
             _axisZ               = serializedObject.FindProperty(nameof(PlyImporter.AxisZ));
             _rescale             = serializedObject.FindProperty(nameof(PlyImporter.Rescale));
             _applySRGBCorrection = serializedObject.FindProperty(nameof(PlyImporter.ApplySRGBCorrection));
+            _shufflePoints       = serializedObject.FindProperty(nameof(PlyImporter.ShufflePoints));
+            _shuffleSeed         = serializedObject.FindProperty(nameof(PlyImporter.ShuffleSeed));
             _importProperties    = serializedObject.FindProperty(nameof(PlyImporter.ImportProperties));
             _variants            = serializedObject.FindProperty(nameof(PlyImporter.Variants));
 
@@ -85,6 +89,18 @@ namespace StoryLabResearch.PointCloud
 
             EditorGUILayout.PropertyField(_rescale);
             EditorGUILayout.PropertyField(_applySRGBCorrection);
+            EditorGUILayout.Space();
+
+            EditorGUILayout.LabelField("Point Order", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(_shufflePoints, new GUIContent("Shuffle Points",
+                "Randomises point order before building the BVH to remove scan-line artefacts at lower LOD levels."));
+            if (_shufflePoints.boolValue)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.PropertyField(_shuffleSeed, new GUIContent("Seed",
+                    "Stored in the .meta file so the shuffle is identical across machines. Change to get a different result."));
+                EditorGUI.indentLevel--;
+            }
             EditorGUILayout.Space();
 
             EditorGUILayout.PropertyField(_importProperties,
