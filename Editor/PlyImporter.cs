@@ -57,8 +57,9 @@ namespace StoryLabResearch.PointCloud
             ReadPointData(context.assetPath, out var positions, out var colors);
             if (positions == null) return;
 
-            if (ShufflePoints)
-                ShuffleArrays(positions, colors, ShuffleSeed);
+            int[] shuffledIndices = ShufflePoints
+                ? ShuffleIndices(positions.Length, ShuffleSeed)
+                : null;
 
             var name     = Path.GetFileNameWithoutExtension(context.assetPath);
             var variants = ResolvedVariants;
@@ -86,7 +87,7 @@ namespace StoryLabResearch.PointCloud
                 if (variant == null) return;
                 bvhData[i] = BVHBuilder.ComputeBVHData(
                     positions, colors, variant.MinPointSpacing, variant.MaxNodeSideLength,
-                    deferredLogs[i]);
+                    deferredLogs[i], shuffledIndices);
             });
 
             EditorUtility.ClearProgressBar();
@@ -173,15 +174,17 @@ namespace StoryLabResearch.PointCloud
             }
         }
 
-        private static void ShuffleArrays(Vector3[] positions, uint[] colors, int seed)
+        private static int[] ShuffleIndices(int count, int seed)
         {
+            var arr = new int[count];
+            for (int i = 0; i < count; i++) arr[i] = i;
             var rng = new System.Random(seed);
-            for (int i = positions.Length - 1; i > 0; i--)
+            for (int i = count - 1; i > 0; i--)
             {
                 int j = rng.Next(i + 1);
-                (positions[i], positions[j]) = (positions[j], positions[i]);
-                (colors[i],    colors[j])    = (colors[j],    colors[i]);
+                (arr[i], arr[j]) = (arr[j], arr[i]);
             }
+            return arr;
         }
 
         private static float SampleAxis(Vector3 p, EAxis axis)

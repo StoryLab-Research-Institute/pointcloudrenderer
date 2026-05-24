@@ -37,18 +37,20 @@ namespace StoryLabResearch.PointCloud
         }
 
         // Pure computation — no Unity API calls, safe to call from any thread.
+        // initialIndices: optional pre-built (and optionally pre-shuffled) index array.
+        // Pass null to use a plain identity ordering.
         public static BVHData ComputeBVHData(
             Vector3[] positions, uint[] colors,
             float minPointSpacing, float maxNodeSideLength,
-            System.Collections.Generic.List<string> deferredLogs = null)
+            System.Collections.Generic.List<string> deferredLogs = null,
+            int[] initialIndices = null)
         {
             int totalPoints = positions.Length;
 
             int[] indices;
             if (minPointSpacing > 0f)
             {
-                var allIndices = new int[totalPoints];
-                for (int i = 0; i < totalPoints; i++) allIndices[i] = i;
+                var allIndices = initialIndices ?? MakeIdentityIndices(totalPoints);
                 indices = SphereExclusionSubsample(positions, allIndices, minPointSpacing);
                 deferredLogs?.Add($"[BVHBuilder] Pre-thin: {totalPoints} → {indices.Length} points " +
                                   $"(spacing {minPointSpacing:F4}m).");
@@ -56,8 +58,7 @@ namespace StoryLabResearch.PointCloud
             }
             else
             {
-                indices = new int[totalPoints];
-                for (int i = 0; i < totalPoints; i++) indices[i] = i;
+                indices = initialIndices != null ? (int[])initialIndices.Clone() : MakeIdentityIndices(totalPoints);
             }
 
             var metaList  = new List<BVHAsset.PublicNodeMetadata>();
@@ -199,6 +200,13 @@ namespace StoryLabResearch.PointCloud
                 LeftIndex     = leftIndex,
                 RightIndex    = rightIndex,
             };
+        }
+
+        private static int[] MakeIdentityIndices(int count)
+        {
+            var arr = new int[count];
+            for (int i = 0; i < count; i++) arr[i] = i;
+            return arr;
         }
 
         // Grid subsample: keeps at most one point per cell of a uniform grid over bounds.
