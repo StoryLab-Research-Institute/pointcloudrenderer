@@ -16,15 +16,7 @@ namespace StoryLabResearch.PointCloud
         public int   GlobalBufferOffset; // offset in points into BVHAsset.GlobalPointBuffer
         public float LodScaleBase;       // sqrt(OriginalCount / PointCount) — precomputed at load time
 
-        public int  IndexInRenderer = -1; // set by PointCloudRenderer during node-array rebuild
-        public bool IsLoaded;
-        public bool IsLeaf => Left == null && Right == null;
-
-        public void ReleaseBuffers()
-        {
-            IsLoaded  = false;
-            PointCount = 0;
-            OriginalCount = 0;
-        }
+        public bool IsLoaded => PointCount > 0;
+        public bool IsLeaf   => Left == null && Right == null;
     }
 }

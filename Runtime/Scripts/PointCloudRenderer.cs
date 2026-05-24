@@ -185,7 +185,8 @@ namespace StoryLabResearch.PointCloud
         private Camera           _cullingCamera;
         private Matrix4x4        _lastLocalToWorld;
 
-        // Per-node indexed state — parallel arrays over _cullingNodes, indexed by BVHNode.IndexInRenderer.
+        // Per-node indexed state — parallel arrays over _cullingNodes, looked up via _nodeIndex.
+        private Dictionary<BVHNode, int> _nodeIndex = new();
         private bool[]           _occludedFlags     = new bool[0];
         private bool[]           _expandedFlags     = new bool[0];
         private bool[]           _prevExpandedFlags = new bool[0];
@@ -266,9 +267,6 @@ namespace StoryLabResearch.PointCloud
             DisposeCullingGroup();
             DisposeIndirectBuffers();
             DestroyMaterialInstance();
-            if (_variants != null)
-                foreach (var entry in _variants)
-                    entry.Asset?.Unload();
         }
 
 #if UNITY_EDITOR
@@ -340,8 +338,9 @@ namespace StoryLabResearch.PointCloud
         private void RebuildNodeArrays()
         {
             int n = _cullingNodes.Length;
+            _nodeIndex = new Dictionary<BVHNode, int>(n);
             for (int i = 0; i < n; i++)
-                _cullingNodes[i].IndexInRenderer = i;
+                _nodeIndex[_cullingNodes[i]] = i;
 
             _occludedFlags = new bool[n];
             _expandedFlags = new bool[n];
@@ -503,7 +502,7 @@ namespace StoryLabResearch.PointCloud
                     var parent = entry.Parent;
                     if (parent != null && parent.IsLoaded)
                     {
-                        int pi = parent.IndexInRenderer;
+                        int pi = _nodeIndex[parent];
                         if (_selectedError[pi] < 0f)
                             _selectedIndices[_selectedCount++] = pi;
                         _selectedError[pi] = entry.ScreenError;
@@ -513,7 +512,7 @@ namespace StoryLabResearch.PointCloud
 
                 if (entry.ScreenError < sqMinEffThreshold || remaining <= 0)
                 {
-                    int nodeIdx = node.IndexInRenderer;
+                    int nodeIdx = _nodeIndex[node];
                     if (_selectedError[nodeIdx] < 0f)
                         _selectedIndices[_selectedCount++] = nodeIdx;
                     _selectedError[nodeIdx] = entry.ScreenError;
@@ -524,7 +523,7 @@ namespace StoryLabResearch.PointCloud
                         var e = HeapPop();
                         var n = e.Node;
                         if (!n.IsLoaded) continue;
-                        int ni = n.IndexInRenderer;
+                        int ni = _nodeIndex[n];
                         if (_selectedError[ni] < 0f)
                             _selectedIndices[_selectedCount++] = ni;
                         _selectedError[ni] = e.ScreenError;
@@ -540,7 +539,7 @@ namespace StoryLabResearch.PointCloud
                     sqEffectiveThreshold *= mul * mul;
                 }
 
-                int  nIdx        = node.IndexInRenderer;
+                int  nIdx        = _nodeIndex[node];
                 bool wasExpanded = _prevExpandedFlags[nIdx];
                 float sqThreshold = wasExpanded
                     ? sqEffectiveThreshold * (hysteresisMul * hysteresisMul)
@@ -592,8 +591,8 @@ namespace StoryLabResearch.PointCloud
                 float sqError     = _selectedError[idx];
                 if (node.PointCount == 0) continue;
                 if (minDrawFrac > 0f && sqError < sqMinDrawError) continue;
-                bool leftSelected  = node.Left  != null && _selectedError[node.Left.IndexInRenderer]  >= 0f;
-                bool rightSelected = node.Right != null && _selectedError[node.Right.IndexInRenderer] >= 0f;
+                bool leftSelected  = node.Left  != null && _selectedError[_nodeIndex[node.Left]]  >= 0f;
+                bool rightSelected = node.Right != null && _selectedError[_nodeIndex[node.Right]] >= 0f;
                 if (leftSelected && rightSelected) continue;
 
                 if (node.PointCount > maxPointCount) maxPointCount = node.PointCount;
@@ -686,7 +685,7 @@ namespace StoryLabResearch.PointCloud
             Matrix4x4 m, bool occlusionCull)
         {
             if (node == null) return;
-            if (occlusionCull && _occludedFlags[node.IndexInRenderer]) return;
+            if (occlusionCull && _occludedFlags[_nodeIndex[node]]) return;
 
             float lx = node.BoundsMin.x,  ly = node.BoundsMin.y,  lz = node.BoundsMin.z;
             float sx = node.BoundsSize.x, sy = node.BoundsSize.y, sz = node.BoundsSize.z;

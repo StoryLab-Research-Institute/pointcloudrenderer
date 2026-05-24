@@ -30,13 +30,12 @@ namespace StoryLabResearch.PointCloud
         [SerializeField, HideInInspector] private NodeMetadata[] _nodeMetadata;
         [SerializeField, HideInInspector] private byte[]         _pointData;
 
-        private BVHNode[]      _nodes;
-        private bool           _loaded;
+        private BVHNode[] _nodes;
+        private bool      _loaded;
 
         // Global merged GPU buffer: all nodes' points concatenated (uint3 per point, 12 bytes each).
-        public GraphicsBuffer  GlobalPointBuffer { get; private set; }
-        // Flat array parallel to the BVH node array, indexed by BVHNode.IndexInRenderer.
-        public NodeData[]      NodeDataArray     { get; private set; }
+        public GraphicsBuffer GlobalPointBuffer { get; private set; }
+        public NodeData[]     NodeDataArray     { get; private set; }
 
         public BVHNode Root => (_nodes != null && _nodes.Length > 0) ? _nodes[0] : null;
 
@@ -60,9 +59,14 @@ namespace StoryLabResearch.PointCloud
                 _nodes[i] = new BVHNode
                 {
                     Bounds        = meta.Bounds,
+                    BoundsMin     = meta.Bounds.min,
+                    BoundsSize    = meta.Bounds.size,
                     Depth         = meta.Depth,
                     PointCount    = meta.PointCount,
                     OriginalCount = meta.OriginalCount,
+                    LodScaleBase  = meta.PointCount > 0 && meta.OriginalCount > meta.PointCount
+                                        ? Mathf.Sqrt((float)meta.OriginalCount / meta.PointCount)
+                                        : 1f,
                 };
             }
 
@@ -112,36 +116,27 @@ namespace StoryLabResearch.PointCloud
 
                 fileOffset += meta.ByteLength;
 
+                node.GlobalBufferOffset = nodeOffset;
+
                 NodeDataArray[i] = new NodeData
                 {
-                    Bounds              = meta.Bounds,
-                    PointCount          = meta.PointCount,
-                    OriginalCount       = meta.OriginalCount,
-                    GlobalBufferOffset  = nodeOffset,
+                    Bounds             = meta.Bounds,
+                    PointCount         = meta.PointCount,
+                    OriginalCount      = meta.OriginalCount,
+                    GlobalBufferOffset = nodeOffset,
                 };
-
-                node.GlobalBufferOffset = nodeOffset;
-                node.BoundsMin  = meta.Bounds.min;
-                node.BoundsSize = meta.Bounds.size;
-                node.LodScaleBase = meta.PointCount > 0 && meta.OriginalCount > meta.PointCount
-                    ? Mathf.Sqrt((float)meta.OriginalCount / meta.PointCount)
-                    : 1f;
-                node.IsLoaded = meta.PointCount > 0;
             }
 
             _loaded = true;
         }
 
-        public void Unload()
+        private void OnDisable()
         {
-            if (!_loaded || _nodes == null) return;
-            foreach (var node in _nodes)
-                node.ReleaseBuffers();
             GlobalPointBuffer?.Release();
             GlobalPointBuffer = null;
             NodeDataArray     = null;
-            _nodes  = null;
-            _loaded = false;
+            _nodes            = null;
+            _loaded           = false;
         }
 
         // Called by BVHBuilder to populate the asset before embedding it as a sub-asset.
@@ -178,7 +173,5 @@ namespace StoryLabResearch.PointCloud
             _loaded = false;
             _nodes  = null;
         }
-
-        private void OnDisable() => Unload();
     }
 }
