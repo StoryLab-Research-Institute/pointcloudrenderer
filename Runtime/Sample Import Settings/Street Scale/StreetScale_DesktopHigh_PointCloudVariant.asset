@@ -18,8 +18,8 @@ MonoBehaviour:
   MaxNodeSideLength: 1
   Material: {fileID: 2100000, guid: 959e84d8f72f19042ad0c50a5fc6e6cc, type: 2}
   MaterialMode: 0
-  PointBudget: 2000000
-  ScreenErrorThreshold: 0.05
+  PointBudget: 4000000
+  ScreenErrorThreshold: 0.03
   MinDrawErrorFraction: 0.1
   PointSizeScale: 0.02
   OcclusionCullingEnabled: 1
