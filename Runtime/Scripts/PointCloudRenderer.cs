@@ -124,8 +124,10 @@ namespace StoryLabResearch.PointCloud
 
         // ----- Diagnostics -----
 
+#if UNITY_EDITOR
         [Tooltip("In edit mode, follow the scene view camera instead of Camera.main.")]
         [SerializeField] private bool UseSceneCameraInEditMode = true;
+#endif
 
         // Fovea position in normalised viewport space. Defaults to screen centre.
         [NonSerialized] public Vector2 FoveationCentre = new Vector2(0.5f, 0.5f);
@@ -159,6 +161,7 @@ namespace StoryLabResearch.PointCloud
         private static readonly int PropPoints          = Shader.PropertyToID("_Points");
         private static readonly int PropNodeDescriptors = Shader.PropertyToID("_NodeDescriptors");
 
+#if UNITY_EDITOR
         [Tooltip("Gizmo colour for this renderer. Leave alpha=0 to generate a random colour on first use.")]
         [SerializeField] private Color _gizmoColor = Color.clear;
 
@@ -171,6 +174,7 @@ namespace StoryLabResearch.PointCloud
                 return new Color(_gizmoColor.r, _gizmoColor.g, _gizmoColor.b, 1f);
             }
         }
+#endif
 
         private BVHAsset  _lastActiveAsset;
         private Material  _activeMaterialInstance;
@@ -638,6 +642,9 @@ namespace StoryLabResearch.PointCloud
             {
                 _indirectDrawable = new IndirectDrawable();
                 PointCloudRenderFeature.PointCloudRenderPass.Register(_indirectDrawable);
+#if UNITY_EDITOR
+                SceneView.RepaintAll();
+#endif
             }
             _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], localToWorld);
 
