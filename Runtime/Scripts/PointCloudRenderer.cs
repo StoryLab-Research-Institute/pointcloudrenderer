@@ -46,6 +46,11 @@ namespace StoryLabResearch.PointCloud
         [Tooltip("Multiplier on the render properties MinDrawErrorFraction.")]
         public float MinDrawErrorMultiplier = 1f;
 
+        [Tooltip("Use Unity's occlusion bake to skip nodes hidden behind scene geometry. " +
+                 "Useful when the camera is inside a dense cloud with many occluders. " +
+                 "Has no effect in the editor — the editor does not run the occlusion rasteriser.")]
+        public bool OcclusionCulling = true;
+
         // ----- Variant resolution -----
 
         private int ClampedVariantIndex =>
@@ -152,7 +157,7 @@ namespace StoryLabResearch.PointCloud
         private float P_PointSizeScale       => (ActiveVariant?.PointSizeScale ?? DefaultPointSizeScale)
                                                     * PointSizeMultiplier;
 
-        private bool  P_OcclusionCulling     => ActiveVariant?.OcclusionCullingEnabled ?? true;
+        private bool  P_OcclusionCulling     => OcclusionCulling;
         private bool  P_FoveationEnabled     => ActiveVariant?.FoveationEnabled        ?? false;
         private float P_FoveationStrength    => ActiveVariant?.FoveationStrength       ?? 32f;
         private float P_FoveationInnerRadius => ActiveVariant?.FoveationInnerRadius    ?? 0.2f;
@@ -227,22 +232,6 @@ namespace StoryLabResearch.PointCloud
         private int            _bufferIndex;          // toggles 0/1 each frame
         private GraphicsBuffer _lastBoundPointBuffer; // the GlobalPointBuffer instance currently bound to the material
         private IndirectDrawable _indirectDrawable;   // single registered drawable
-
-        private static bool TestAABBFrustum(float minX, float minY, float minZ,
-                                             float maxX, float maxY, float maxZ,
-                                             Plane[] planes)
-        {
-            for (int i = 0; i < 6; i++)
-            {
-                var   n  = planes[i].normal;
-                float d  = planes[i].distance;
-                float px = n.x >= 0f ? maxX : minX;
-                float py = n.y >= 0f ? maxY : minY;
-                float pz = n.z >= 0f ? maxZ : minZ;
-                if (n.x * px + n.y * py + n.z * pz + d < 0f) return false;
-            }
-            return true;
-        }
 
         private void DestroyMaterialInstance()
         {
@@ -448,14 +437,19 @@ namespace StoryLabResearch.PointCloud
             // Derive halfFovTan from the projection matrix so it remains correct even when
             // cam.fieldOfView hasn't been updated by the XR runtime yet (e.g. Quest Link init).
             float halfFovTan = 1f / cam.projectionMatrix.m11;
-            var   vpMatrix   = cam.projectionMatrix * cam.worldToCameraMatrix;
 
             bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
             _stereoFrustum = stereoInstanced;
+            Matrix4x4 vpMatrix;
             if (stereoInstanced)
             {
                 var leftVP  = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Left)  * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Left);
                 var rightVP = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Right) * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Right);
+                // Average the two eye VP matrices for foveation — the IPD offset is negligible
+                // at typical viewing distances and foveation is already a soft approximation.
+                vpMatrix = Matrix4x4.zero;
+                for (int mi = 0; mi < 16; mi++)
+                    vpMatrix[mi] = (leftVP[mi] + rightVP[mi]) * 0.5f;
                 GeometryUtility.CalculateFrustumPlanes(leftVP,  _frustumPlanes);
                 GeometryUtility.CalculateFrustumPlanes(rightVP, _frustumPlanesR);
                 for (int pi = 0; pi < 6; pi++)
@@ -468,6 +462,7 @@ namespace StoryLabResearch.PointCloud
             }
             else
             {
+                vpMatrix = cam.projectionMatrix * cam.worldToCameraMatrix;
                 GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
                 for (int pi = 0; pi < 6; pi++)
                 {

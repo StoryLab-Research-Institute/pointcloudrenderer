@@ -22,7 +22,6 @@ MonoBehaviour:
   ScreenErrorThreshold: 0.03
   MinDrawErrorFraction: 0.1
   PointSizeScale: 0.02
-  OcclusionCullingEnabled: 1
   FoveationEnabled: 1
   FoveationStrength: 8
   FoveationInnerRadius: 0.4

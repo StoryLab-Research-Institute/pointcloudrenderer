@@ -61,11 +61,7 @@ namespace StoryLabResearch.PointCloud
                  "The per-node scale is derived from the subsampling ratio and multiplied by this value.")]
         public float PointSizeScale = 0.02f;
 
-        [Tooltip("Use Unity's occlusion bake to skip nodes hidden behind scene geometry. " +
-                 "Only active in player builds — the editor does not run the occlusion rasteriser.")]
-        public bool OcclusionCullingEnabled = true;
-
-        [Tooltip("Concentrate the point budget near the screen centre, reducing detail in peripheral vision.")]
+[Tooltip("Concentrate the point budget near the screen centre, reducing detail in peripheral vision.")]
         public bool FoveationEnabled = false;
 
         [Tooltip("How much to raise the LOD stopping threshold for peripheral nodes. " +
