@@ -203,10 +203,12 @@ namespace StoryLabResearch.PointCloud
         private int          _heapCount = 0;
 
         private readonly Plane[] _frustumPlanes  = new Plane[6];
-        private readonly Plane[] _frustumPlanesR = new Plane[6]; // right-eye scratch buffer for stereo merge
+        private readonly Plane[] _frustumPlanesR = new Plane[6];
         // Frustum plane components extracted to flat floats — avoids Plane.normal/distance property
         // interop in the HeapPush hot path (called once per node visited, 6 planes each).
-        private readonly float[] _fpNx = new float[6], _fpNy = new float[6], _fpNz = new float[6], _fpD = new float[6];
+        private readonly float[] _fpNx  = new float[6], _fpNy  = new float[6], _fpNz  = new float[6], _fpD  = new float[6];
+        private readonly float[] _fpNxR = new float[6], _fpNyR = new float[6], _fpNzR = new float[6], _fpDR = new float[6];
+        private bool _stereoFrustum;
 
         // Indirect draw state.
         // NodeDescriptor layout (48 bytes = 3 float4s):
@@ -449,26 +451,19 @@ namespace StoryLabResearch.PointCloud
             var   vpMatrix   = cam.projectionMatrix * cam.worldToCameraMatrix;
 
             bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
+            _stereoFrustum = stereoInstanced;
             if (stereoInstanced)
             {
-                // Compute a merged frustum that covers both eyes: for each plane keep whichever
-                // eye's version is least restrictive (dot-product offset further from origin),
-                // so no node visible in either eye is incorrectly culled.
                 var leftVP  = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Left)  * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Left);
                 var rightVP = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Right) * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Right);
                 GeometryUtility.CalculateFrustumPlanes(leftVP,  _frustumPlanes);
                 GeometryUtility.CalculateFrustumPlanes(rightVP, _frustumPlanesR);
                 for (int pi = 0; pi < 6; pi++)
                 {
-                    // A plane with a larger distance value is more permissive (the half-space it
-                    // accepts is wider), so take the max distance to avoid false culling.
-                    Plane l = _frustumPlanes[pi], r = _frustumPlanesR[pi];
-                    Plane merged = l.distance >= r.distance ? l : r;
-                    var n     = merged.normal;
-                    _fpNx[pi] = n.x;
-                    _fpNy[pi] = n.y;
-                    _fpNz[pi] = n.z;
-                    _fpD[pi]  = merged.distance;
+                    var ln     = _frustumPlanes[pi].normal;
+                    _fpNx[pi]  = ln.x; _fpNy[pi]  = ln.y; _fpNz[pi]  = ln.z; _fpD[pi]  = _frustumPlanes[pi].distance;
+                    var rn     = _frustumPlanesR[pi].normal;
+                    _fpNxR[pi] = rn.x; _fpNyR[pi] = rn.y; _fpNzR[pi] = rn.z; _fpDR[pi] = _frustumPlanesR[pi].distance;
                 }
             }
             else
@@ -476,12 +471,8 @@ namespace StoryLabResearch.PointCloud
                 GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
                 for (int pi = 0; pi < 6; pi++)
                 {
-                    var p      = _frustumPlanes[pi];
-                    var n      = p.normal;
-                    _fpNx[pi]  = n.x;
-                    _fpNy[pi]  = n.y;
-                    _fpNz[pi]  = n.z;
-                    _fpD[pi]   = p.distance;
+                    var n      = _frustumPlanes[pi].normal;
+                    _fpNx[pi]  = n.x; _fpNy[pi]  = n.y; _fpNz[pi]  = n.z; _fpD[pi]  = _frustumPlanes[pi].distance;
                 }
             }
 
@@ -523,7 +514,7 @@ namespace StoryLabResearch.PointCloud
             Array.Clear(_expandedFlags, 0, _expandedFlags.Length);
 
             _heapCount = 0;
-            HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull);
+            HeapPush(asset.Root, null, camPos, halfFovTan, localToWorld, occlusionCull, _stereoFrustum);
 
             while (_heapCount > 0)
             {
@@ -581,8 +572,8 @@ namespace StoryLabResearch.PointCloud
                 if (entry.ScreenError >= sqThreshold && !node.IsLeaf && remaining > 0)
                 {
                     _expandedFlags[nIdx] = true;
-                    if (node.Left  != null) HeapPush(node.Left,  node, camPos, halfFovTan, localToWorld, occlusionCull);
-                    if (node.Right != null) HeapPush(node.Right, node, camPos, halfFovTan, localToWorld, occlusionCull);
+                    if (node.Left  != null) HeapPush(node.Left,  node, camPos, halfFovTan, localToWorld, occlusionCull, _stereoFrustum);
+                    if (node.Right != null) HeapPush(node.Right, node, camPos, halfFovTan, localToWorld, occlusionCull, _stereoFrustum);
                     continue;
                 }
 
@@ -717,7 +708,7 @@ namespace StoryLabResearch.PointCloud
         // ----- Heap push/pop (max-heap on ScreenError) -----
 
         private void HeapPush(BVHNode node, BVHNode parent, Vector3 camPos, float halfFovTan,
-            Matrix4x4 m, bool occlusionCull)
+            Matrix4x4 m, bool occlusionCull, bool stereoFrustum)
         {
             if (node == null) return;
             if (occlusionCull && _occludedFlags[_nodeIndex[node]]) return;
@@ -739,18 +730,49 @@ namespace StoryLabResearch.PointCloud
             float wmaxX = wcx + wex, wmaxY = wcy + wey, wmaxZ = wcz + wez;
 
             float nx, ny, nz, d;
-            nx = _fpNx[0]; ny = _fpNy[0]; nz = _fpNz[0]; d = _fpD[0];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
-            nx = _fpNx[1]; ny = _fpNy[1]; nz = _fpNz[1]; d = _fpD[1];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
-            nx = _fpNx[2]; ny = _fpNy[2]; nz = _fpNz[2]; d = _fpD[2];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
-            nx = _fpNx[3]; ny = _fpNy[3]; nz = _fpNz[3]; d = _fpD[3];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
-            nx = _fpNx[4]; ny = _fpNy[4]; nz = _fpNz[4]; d = _fpD[4];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
-            nx = _fpNx[5]; ny = _fpNy[5]; nz = _fpNz[5]; d = _fpD[5];
-            if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+            // In stereo mode cull only if outside BOTH eye frustums.
+            if (stereoFrustum)
+            {
+                nx = _fpNx[0]; ny = _fpNy[0]; nz = _fpNz[0]; d = _fpD[0];
+                bool l0 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[0]; ny = _fpNyR[0]; nz = _fpNzR[0]; d = _fpDR[0];
+                if (l0 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[1]; ny = _fpNy[1]; nz = _fpNz[1]; d = _fpD[1];
+                bool l1 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[1]; ny = _fpNyR[1]; nz = _fpNzR[1]; d = _fpDR[1];
+                if (l1 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[2]; ny = _fpNy[2]; nz = _fpNz[2]; d = _fpD[2];
+                bool l2 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[2]; ny = _fpNyR[2]; nz = _fpNzR[2]; d = _fpDR[2];
+                if (l2 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[3]; ny = _fpNy[3]; nz = _fpNz[3]; d = _fpD[3];
+                bool l3 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[3]; ny = _fpNyR[3]; nz = _fpNzR[3]; d = _fpDR[3];
+                if (l3 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[4]; ny = _fpNy[4]; nz = _fpNz[4]; d = _fpD[4];
+                bool l4 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[4]; ny = _fpNyR[4]; nz = _fpNzR[4]; d = _fpDR[4];
+                if (l4 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[5]; ny = _fpNy[5]; nz = _fpNz[5]; d = _fpD[5];
+                bool l5 = nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f;
+                nx = _fpNxR[5]; ny = _fpNyR[5]; nz = _fpNzR[5]; d = _fpDR[5];
+                if (l5 && nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+            }
+            else
+            {
+                nx = _fpNx[0]; ny = _fpNy[0]; nz = _fpNz[0]; d = _fpD[0];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[1]; ny = _fpNy[1]; nz = _fpNz[1]; d = _fpD[1];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[2]; ny = _fpNy[2]; nz = _fpNz[2]; d = _fpD[2];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[3]; ny = _fpNy[3]; nz = _fpNz[3]; d = _fpD[3];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[4]; ny = _fpNy[4]; nz = _fpNz[4]; d = _fpD[4];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+                nx = _fpNx[5]; ny = _fpNy[5]; nz = _fpNz[5]; d = _fpD[5];
+                if (nx * (nx >= 0f ? wmaxX : wminX) + ny * (ny >= 0f ? wmaxY : wminY) + nz * (nz >= 0f ? wmaxZ : wminZ) + d < 0f) return;
+            }
 
             float ddx = camPos.x < wminX ? wminX - camPos.x : camPos.x > wmaxX ? camPos.x - wmaxX : 0f;
             float ddy = camPos.y < wminY ? wminY - camPos.y : camPos.y > wmaxY ? camPos.y - wmaxY : 0f;
