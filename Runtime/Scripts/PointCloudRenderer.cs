@@ -659,7 +659,6 @@ namespace StoryLabResearch.PointCloud
 
             _nodeDescriptorBuffer[bi].SetData(_nodeDescriptorData, 0, 0, validCount * 12);
             _indirectArgsData[0] = (uint)(maxPointCount * 6);
-            bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
             _indirectArgsData[1] = (uint)(stereoInstanced ? validCount * 2 : validCount);
             _indirectArgsData[2] = 0;
             _indirectArgsData[3] = 0;
