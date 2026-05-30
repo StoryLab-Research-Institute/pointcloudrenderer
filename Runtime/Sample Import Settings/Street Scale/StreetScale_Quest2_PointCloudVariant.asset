@@ -25,5 +25,5 @@ MonoBehaviour:
   OcclusionCullingEnabled: 1
   FoveationEnabled: 1
   FoveationStrength: 8
-  FoveationInnerRadius: 0.35
+  FoveationInnerRadius: 0.38
   LodHysteresis: 0.4

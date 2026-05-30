@@ -24,6 +24,6 @@ MonoBehaviour:
   PointSizeScale: 0.02
   OcclusionCullingEnabled: 1
   FoveationEnabled: 1
-  FoveationStrength: 16
-  FoveationInnerRadius: 0.39
+  FoveationStrength: 8
+  FoveationInnerRadius: 0.4
   LodHysteresis: 0.3
