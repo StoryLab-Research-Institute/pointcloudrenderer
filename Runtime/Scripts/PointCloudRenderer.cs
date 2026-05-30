@@ -202,7 +202,8 @@ namespace StoryLabResearch.PointCloud
         private QueueEntry[] _heap      = Array.Empty<QueueEntry>();
         private int          _heapCount = 0;
 
-        private readonly Plane[] _frustumPlanes = new Plane[6];
+        private readonly Plane[] _frustumPlanes  = new Plane[6];
+        private readonly Plane[] _frustumPlanesR = new Plane[6]; // right-eye scratch buffer for stereo merge
         // Frustum plane components extracted to flat floats — avoids Plane.normal/distance property
         // interop in the HeapPush hot path (called once per node visited, 6 planes each).
         private readonly float[] _fpNx = new float[6], _fpNy = new float[6], _fpNz = new float[6], _fpD = new float[6];
@@ -442,18 +443,46 @@ namespace StoryLabResearch.PointCloud
             var   localToWorld = transform.localToWorldMatrix;
 
             var   camPos     = cam.transform.position;
-            float halfFovTan = Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            // Derive halfFovTan from the projection matrix so it remains correct even when
+            // cam.fieldOfView hasn't been updated by the XR runtime yet (e.g. Quest Link init).
+            float halfFovTan = 1f / cam.projectionMatrix.m11;
             var   vpMatrix   = cam.projectionMatrix * cam.worldToCameraMatrix;
 
-            GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
-            for (int pi = 0; pi < 6; pi++)
+            bool stereoInstanced = XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.SinglePassInstanced;
+            if (stereoInstanced)
             {
-                var p      = _frustumPlanes[pi];
-                var n      = p.normal;
-                _fpNx[pi]  = n.x;
-                _fpNy[pi]  = n.y;
-                _fpNz[pi]  = n.z;
-                _fpD[pi]   = p.distance;
+                // Compute a merged frustum that covers both eyes: for each plane keep whichever
+                // eye's version is least restrictive (dot-product offset further from origin),
+                // so no node visible in either eye is incorrectly culled.
+                var leftVP  = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Left)  * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Left);
+                var rightVP = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Right) * cam.GetStereoViewMatrix(Camera.StereoscopicEye.Right);
+                GeometryUtility.CalculateFrustumPlanes(leftVP,  _frustumPlanes);
+                GeometryUtility.CalculateFrustumPlanes(rightVP, _frustumPlanesR);
+                for (int pi = 0; pi < 6; pi++)
+                {
+                    // A plane with a larger distance value is more permissive (the half-space it
+                    // accepts is wider), so take the max distance to avoid false culling.
+                    Plane l = _frustumPlanes[pi], r = _frustumPlanesR[pi];
+                    Plane merged = l.distance >= r.distance ? l : r;
+                    var n     = merged.normal;
+                    _fpNx[pi] = n.x;
+                    _fpNy[pi] = n.y;
+                    _fpNz[pi] = n.z;
+                    _fpD[pi]  = merged.distance;
+                }
+            }
+            else
+            {
+                GeometryUtility.CalculateFrustumPlanes(cam, _frustumPlanes);
+                for (int pi = 0; pi < 6; pi++)
+                {
+                    var p      = _frustumPlanes[pi];
+                    var n      = p.normal;
+                    _fpNx[pi]  = n.x;
+                    _fpNy[pi]  = n.y;
+                    _fpNz[pi]  = n.z;
+                    _fpD[pi]   = p.distance;
+                }
             }
 
             bool  fovEnabled     = P_FoveationEnabled;
