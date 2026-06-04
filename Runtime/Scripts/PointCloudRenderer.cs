@@ -334,9 +334,12 @@ namespace StoryLabResearch.PointCloud
 #if UNITY_EDITOR
         private static SceneView FindSceneViewForScene(Scene scene)
         {
+            // Match by the view camera's scene (public) rather than SceneView.customScene,
+            // whose accessibility varies across editor versions. A prefab-stage scene view's
+            // camera has Camera.scene set to the stage scene.
             foreach (SceneView sv in SceneView.sceneViews)
             {
-                if (sv != null && sv.customScene == scene)
+                if (sv != null && sv.camera != null && sv.camera.scene == scene)
                     return sv;
             }
             return null;
