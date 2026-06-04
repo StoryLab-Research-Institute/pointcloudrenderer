@@ -34,6 +34,7 @@ namespace StoryLabResearch.PointCloud
             private class PassData
             {
                 public List<IPointCloudDrawable> Drawables;
+                public Camera Camera;
             }
 
             public PointCloudRenderPass()
@@ -53,9 +54,11 @@ namespace StoryLabResearch.PointCloud
                 if (_drawables.Count == 0) return;
 
                 var resourceData = frameData.Get<UniversalResourceData>();
+                var cameraData   = frameData.Get<UniversalCameraData>();
 
                 using var builder = renderGraph.AddRasterRenderPass<PassData>("PointCloud", out var passData);
                 passData.Drawables = _drawables;
+                passData.Camera    = cameraData.camera;
 
                 // Declare colour and depth attachments so URP can schedule depth priming correctly.
                 builder.SetRenderAttachment(resourceData.activeColorTexture, 0, AccessFlags.Write);
@@ -66,7 +69,8 @@ namespace StoryLabResearch.PointCloud
                 {
                     var cmd = context.cmd;
                     foreach (var drawable in data.Drawables)
-                        drawable.Draw(cmd);
+                        if (drawable.ShouldRenderTo(data.Camera))
+                            drawable.Draw(cmd);
                 });
             }
         }

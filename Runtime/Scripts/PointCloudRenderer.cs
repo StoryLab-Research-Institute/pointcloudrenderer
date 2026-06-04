@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
+using UnityEngine.SceneManagement;
 using UnityEngine.XR;
 #if UNITY_EDITOR
 using UnityEditor;
+using UnityEditor.SceneManagement;
 #endif
 
 namespace StoryLabResearch.PointCloud
@@ -312,12 +314,34 @@ namespace StoryLabResearch.PointCloud
 #if UNITY_EDITOR
             if (!Application.isPlaying && UseSceneCameraInEditMode)
             {
+                // When this renderer lives in an open prefab stage, drive LOD/frustum from the
+                // scene view rendering that stage rather than lastActiveSceneView (which is the
+                // main scene view looking at a different scene).
+                var stage = PrefabStageUtility.GetPrefabStage(gameObject);
+                if (stage != null)
+                {
+                    var stageView = FindSceneViewForScene(stage.scene);
+                    if (stageView != null) return stageView.camera;
+                }
+
                 var sv = SceneView.lastActiveSceneView;
                 if (sv != null) return sv.camera;
             }
 #endif
             return Camera.main;
         }
+
+#if UNITY_EDITOR
+        private static SceneView FindSceneViewForScene(Scene scene)
+        {
+            foreach (SceneView sv in SceneView.sceneViews)
+            {
+                if (sv != null && sv.customScene == scene)
+                    return sv;
+            }
+            return null;
+        }
+#endif
 
         // ----- Node index (always maintained, regardless of occlusion culling) -----
 
@@ -660,7 +684,7 @@ namespace StoryLabResearch.PointCloud
                 SceneView.RepaintAll();
 #endif
             }
-            _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], localToWorld);
+            _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], localToWorld, gameObject.scene);
 
             (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
         }
@@ -872,13 +896,21 @@ namespace StoryLabResearch.PointCloud
             private Material       _material;
             private GraphicsBuffer _argsBuffer;
             private Matrix4x4      _localToWorld;
+            private Scene          _ownerScene;
 
-            public void Set(Material material, GraphicsBuffer argsBuffer, Matrix4x4 localToWorld)
+            public void Set(Material material, GraphicsBuffer argsBuffer, Matrix4x4 localToWorld, Scene ownerScene)
             {
                 _material     = material;
                 _argsBuffer   = argsBuffer;
                 _localToWorld = localToWorld;
+                _ownerScene   = ownerScene;
             }
+
+            // A camera with an invalid scene (normal Game/Scene view cameras) renders every scene.
+            // Cameras with a valid scene (prefab-stage and prefab-icon preview cameras) only render
+            // objects in that same scene, so the cloud no longer bleeds into unrelated previews.
+            public bool ShouldRenderTo(Camera camera) =>
+                !camera.scene.IsValid() || camera.scene == _ownerScene;
 
             public void Draw(RasterCommandBuffer cmd)
             {

@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "displayName": "StoryLab Point Cloud Renderer",
   "description": "BVH-based point cloud renderer for large-scale point clouds. Streaming-ready hierarchical LOD with budget-based traversal, StructuredBuffer rendering (no geometry shader), and cross-platform support including Android/Quest.",
-  "unity": "2022.3",
-  "unityRelease": "5f1",
+  "unity": "6000.0",
+  "unityRelease": "62f1",
   "author": {
     "name": "Chris Nightingale",
     "email": "StoryLab@aru.ac.uk",
