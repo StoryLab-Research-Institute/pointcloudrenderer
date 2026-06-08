@@ -228,8 +228,16 @@ namespace StoryLabResearch.PointCloud
         // CPU-GPU sync stall that SetData causes when writing into a buffer the GPU is still reading.
         private readonly GraphicsBuffer[] _nodeDescriptorBuffer = new GraphicsBuffer[2];
         private readonly GraphicsBuffer[] _indirectArgsBuffer   = new GraphicsBuffer[2];
+        // One MPB per slot, each permanently bound to its slot's descriptor buffer (rebound only
+        // when that slot's buffer is reallocated). The drawable is handed _descriptorMPB[bi] so the
+        // _NodeDescriptors binding travels with the args buffer generation instead of living on the
+        // shared material — see IndirectDrawable.Set.
+        private readonly MaterialPropertyBlock[] _descriptorMPB = new MaterialPropertyBlock[2];
         private float[]        _nodeDescriptorData;   // CPU-side staging array (sized to max capacity)
-        private uint[]         _indirectArgsData;     // [vertexCount, instanceCount, startVertex, startInstance]
+        // Per-slot args staging so slot bi's [vertexCount, instanceCount, ...] is self-consistent with
+        // the descriptors in slot bi. A single shared array would let this frame's maxPointCount/validCount
+        // overwrite the values the previous frame's in-flight draw still expects.
+        private readonly uint[][] _indirectArgsData  = new uint[2][]; // each: [vertexCount, instanceCount, startVertex, startInstance]
         private readonly int[] _descriptorCapacity    = new int[2];
         private int            _bufferIndex;          // toggles 0/1 each frame
         private GraphicsBuffer _lastBoundPointBuffer; // the GlobalPointBuffer instance currently bound to the material
@@ -621,11 +629,16 @@ namespace StoryLabResearch.PointCloud
                 int stagingSize = newCapacity * 12;
                 if (_nodeDescriptorData == null || _nodeDescriptorData.Length < stagingSize)
                     _nodeDescriptorData = new float[stagingSize];
+
+                // Rebind this slot's MPB to the freshly (re)created buffer. Done here — at the
+                // creation site — so the MPB never holds a released buffer after a growth.
+                _descriptorMPB[bi] ??= new MaterialPropertyBlock();
+                _descriptorMPB[bi].SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer[bi]);
             }
             if (_indirectArgsBuffer[bi] == null)
             {
                 _indirectArgsBuffer[bi] = new GraphicsBuffer(GraphicsBuffer.Target.IndirectArguments, 4, sizeof(uint));
-                _indirectArgsData       = new uint[4];
+                _indirectArgsData[bi]   = new uint[4];
             }
 
             int  validCount    = 0;
@@ -671,14 +684,16 @@ namespace StoryLabResearch.PointCloud
             }
 
             _nodeDescriptorBuffer[bi].SetData(_nodeDescriptorData, 0, 0, validCount * 12);
-            _indirectArgsData[0] = (uint)(maxPointCount * 6);
-            _indirectArgsData[1] = (uint)(stereoInstanced ? validCount * 2 : validCount);
-            _indirectArgsData[2] = 0;
-            _indirectArgsData[3] = 0;
-            _indirectArgsBuffer[bi].SetData(_indirectArgsData);
+            var argsData = _indirectArgsData[bi];
+            argsData[0] = (uint)(maxPointCount * 6);
+            argsData[1] = (uint)(stereoInstanced ? validCount * 2 : validCount);
+            argsData[2] = 0;
+            argsData[3] = 0;
+            _indirectArgsBuffer[bi].SetData(argsData);
 
-            mat.SetBuffer(PropNodeDescriptors, _nodeDescriptorBuffer[bi]);
-
+            // _NodeDescriptors travels on the per-slot MPB (bound at the buffer-creation site above),
+            // not on the shared material — so the previous frame's in-flight draw keeps its own
+            // descriptor generation rather than being repointed to this frame's buffer.
             if (_indirectDrawable == null)
             {
                 _indirectDrawable = new IndirectDrawable();
@@ -687,7 +702,7 @@ namespace StoryLabResearch.PointCloud
                 SceneView.RepaintAll();
 #endif
             }
-            _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], localToWorld, gameObject.scene);
+            _indirectDrawable.Set(mat, _indirectArgsBuffer[bi], _descriptorMPB[bi], localToWorld, gameObject.scene);
 
             (_prevExpandedFlags, _expandedFlags) = (_expandedFlags, _prevExpandedFlags);
         }
@@ -855,9 +870,13 @@ namespace StoryLabResearch.PointCloud
                 _indirectArgsBuffer[i]?.Release();
                 _indirectArgsBuffer[i]   = null;
                 _descriptorCapacity[i]   = 0;
+                _indirectArgsData[i]     = null;
+                // MPBs hold a now-released buffer; drop the binding so a stale buffer can't be
+                // rebound. The MPB itself is recreated lazily at the next buffer-creation site.
+                _descriptorMPB[i]?.Clear();
+                _descriptorMPB[i] = null;
             }
             _nodeDescriptorData   = null;
-            _indirectArgsData     = null;
             _bufferIndex          = 0;
             _lastBoundPointBuffer = null;
         }
@@ -896,15 +915,23 @@ namespace StoryLabResearch.PointCloud
 
         private sealed class IndirectDrawable : IPointCloudDrawable
         {
-            private Material       _material;
-            private GraphicsBuffer _argsBuffer;
-            private Matrix4x4      _localToWorld;
-            private Scene          _ownerScene;
+            private Material              _material;
+            private GraphicsBuffer        _argsBuffer;
+            private MaterialPropertyBlock _properties;
+            private Matrix4x4            _localToWorld;
+            private Scene                _ownerScene;
 
-            public void Set(Material material, GraphicsBuffer argsBuffer, Matrix4x4 localToWorld, Scene ownerScene)
+            // properties carries the _NodeDescriptors binding for this draw's buffer generation.
+            // It must be the per-slot MPB that matches argsBuffer's slot, so the previous frame's
+            // still-in-flight DrawProceduralIndirect keeps reading its own generation's descriptors
+            // rather than being repointed when the next frame rebinds. Binding _NodeDescriptors on
+            // the shared material instead would defeat the args double-buffering.
+            public void Set(Material material, GraphicsBuffer argsBuffer,
+                MaterialPropertyBlock properties, Matrix4x4 localToWorld, Scene ownerScene)
             {
                 _material     = material;
                 _argsBuffer   = argsBuffer;
+                _properties   = properties;
                 _localToWorld = localToWorld;
                 _ownerScene   = ownerScene;
             }
@@ -918,7 +945,7 @@ namespace StoryLabResearch.PointCloud
             public void Draw(RasterCommandBuffer cmd)
             {
                 cmd.DrawProceduralIndirect(_localToWorld, _material, 0,
-                    MeshTopology.Triangles, _argsBuffer);
+                    MeshTopology.Triangles, _argsBuffer, 0, _properties);
             }
         }
 
