@@ -117,7 +117,10 @@ Shader "StoryLab Point Cloud/StoryLabPointcloud_URP"
                 //
                 // Without XR stereo instancing (desktop / mono), instanceCount = validCount and
                 // SV_InstanceID is already the plain node index with no eye bit to strip.
-                #if UNITY_STEREO_INSTANCING_ENABLED
+                // NOTE: guard on the STEREO_INSTANCING_ON *keyword* (defined()), not the
+                // UNITY_STEREO_INSTANCING_ENABLED helper — the latter is not a preprocessor
+                // constant in all URP versions and breaks #if with "invalid conditional expression".
+                #if defined(STEREO_INSTANCING_ON)
                 uint nodeIndex       = input.instanceID >> 1u;
                 unity_StereoEyeIndex = input.instanceID & 1u;
                 #else
