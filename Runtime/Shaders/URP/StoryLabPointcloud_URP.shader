@@ -102,20 +102,28 @@ Shader "StoryLab Point Cloud/StoryLabPointcloud_URP"
 
             v2f vert(a2v input)
             {
-                UNITY_SETUP_INSTANCE_ID(input);         // sets unity_InstanceID and unity_StereoEyeIndex
-
-                // Look up this instance's node descriptor (3 consecutive float4s).
-                // Under single-pass instanced stereo, Unity packs [nodeIndex*2 + eyeIndex] into
-                // SV_InstanceID; UNITY_SETUP_INSTANCE_ID extracts the real node index into
-                // unity_InstanceID via >> 1. When instancing is disabled, fall back to raw SV_InstanceID.
-                // Under stereo instancing, UNITY_SETUP_INSTANCE_ID has decoded input.instanceID into
-                // unity_InstanceID (stripping the eye bit). Use that when available; otherwise
-                // input.instanceID is already the plain node index.
-                #if UNITY_ANY_INSTANCING_ENABLED
-                uint nodeIndex = unity_InstanceID;
+                // This is a procedural DrawProceduralIndirect draw, so there is no per-instance
+                // instancing constant buffer for UNITY_SETUP_INSTANCE_ID to decode. We therefore
+                // decode SV_InstanceID by hand rather than relying on unity_InstanceID /
+                // unity_StereoEyeIndex being set for us (they are not, for procedural draws).
+                //
+                // Under single-pass instanced stereo the CPU issues instanceCount = validCount * 2,
+                // laid out as [node0 L, node0 R, node1 L, node1 R, ...] — i.e.
+                //   SV_InstanceID = nodeIndex * 2 + eyeIndex.
+                // We must (a) recover nodeIndex = SV_InstanceID >> 1 so we don't index past the
+                // validCount descriptors, and (b) set unity_StereoEyeIndex = SV_InstanceID & 1 so
+                // the per-eye UNITY_MATRIX_P and the SV_RenderTargetArrayIndex (written by
+                // UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO below) both pick the correct eye.
+                //
+                // Without XR stereo instancing (desktop / mono), instanceCount = validCount and
+                // SV_InstanceID is already the plain node index with no eye bit to strip.
+                #if UNITY_STEREO_INSTANCING_ENABLED
+                uint nodeIndex       = input.instanceID >> 1u;
+                unity_StereoEyeIndex = input.instanceID & 1u;
                 #else
                 uint nodeIndex = input.instanceID;
                 #endif
+
                 uint base3      = nodeIndex * 3u;
                 float4 descA    = _NodeDescriptors[base3 + 0u]; // boundsMin.xyz, lodScale
                 float4 descB    = _NodeDescriptors[base3 + 1u]; // boundsSize.xyz, <pad>
@@ -126,6 +134,8 @@ Shader "StoryLab Point Cloud/StoryLabPointcloud_URP"
                 uint localIndex  = input.vertexID / 6u;
 
                 // Discard vertices that exceed this node's point count (padding from maxPointCount).
+                // unity_StereoEyeIndex must already be set (above) so the output stereo slice is
+                // correct even on this early-out path.
                 v2f o;
                 ZERO_INITIALIZE(v2f, o);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
