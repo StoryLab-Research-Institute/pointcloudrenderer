@@ -183,17 +183,11 @@ Shader "StoryLab Point Cloud/StoryLabPointcloud_URP"
                     abs(UNITY_MATRIX_P._m00),
                     abs(UNITY_MATRIX_P._m11)) * lodScale;
 
-                // 1px minimum: 2/screenHeight in NDC.
+                // 1px minimum: 2/screenHeight in NDC (clip.w ≈ 1 at typical VR distances, close enough).
                 float minExtent = 2.0 / _ScreenParams.y;
                 screenExtent = max(screenExtent, minExtent);
 
-                // screenExtent is an NDC (post-perspective-divide) size, but clipPos is still in
-                // clip space. Scale the offset by clipPos.w so that after the divide the quad has
-                // the intended constant screen size. Omitting *w (the old code assumed w ≈ 1) makes
-                // the on-screen size ∝ 1/w: points near the eye (w→0) or straddling the near plane
-                // (w≤0) explode into huge triangles, and the magnitude differs per eye because w is
-                // per-eye — exactly the near-plane billboard artefact.
-                clipPos.xy += offset * screenExtent * clipPos.w;
+                clipPos.xy += offset * screenExtent;
 
                 o.clipPos = clipPos;
                 o.color   = color;
